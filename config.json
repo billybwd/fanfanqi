@@ -1,0 +1,50 @@
+{
+  "mode": "vs",
+  "player_side": "red",
+  "ai_model": "StrategicV16AI",
+  "think_time_sec": 2.5,
+  "hint_side": "both",
+  "show_hint_on_board": true,
+  "ai_move_delay_ms": 400,
+  "search": {
+    "max_iterative_depth": 7,
+    "max_root_actions": 16,
+    "max_node_actions": 8,
+    "max_noisy_actions": 6,
+    "max_flip_squares": 4,
+    "max_pool_choices": 2,
+    "quiescence_depth": 2
+  },
+  "v16": {
+    "objective": "reward",
+    "future_flip_factor": 0.5,
+    "win_temperature": 12.0,
+    "max_depth": 8,
+    "root_flips": 8,
+    "node_flips": 3,
+    "node_quiet_moves": 10,
+    "qsearch_depth": 4,
+    "full_chance_plies": 1,
+    "weights": {
+      "hp": 1.0,
+      "piece_value": {
+        "将": 10,
+        "仕": 6,
+        "象": 3,
+        "车": 2.5,
+        "马": 2,
+        "炮": 3,
+        "兵": 1.5
+      },
+      "mobility": 0.3,
+      "hanging": 0.6,
+      "hanging_one": 0.15,
+      "pool": 0.3,
+      "king_soldier_adj": 8,
+      "king_soldier_near": 3,
+      "king_cannon": 5,
+      "king_trapped": 2,
+      "tempo": 0.5
+    }
+  }
+}
