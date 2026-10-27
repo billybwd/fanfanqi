@@ -4,10 +4,10 @@
 - 训练样本（每个局面一条）；
 - 外部来源（摄像头识别、其他棋盘程序）同步局面后让 AI 给提示。
 
-状态格式（v5）::
+状态格式（v6）::
 
     {
-      "v": 5,
+      "v": 6,
       "turn": "red",                       # 轮到谁走
       "hp": {"red": 48, "black": 55},      # 可省略；省略时由被吃棋子推算
       "board": [                           # 8 行 × 4 列，行 0 在上
@@ -20,6 +20,7 @@
       },
       "combo": {"red": 0, "black": 2},     # 当前连击（v2，可省略，默认 0）
       "max_combo": {"red": 1, "black": 2}, # 本局最高连击（v2，可省略，默认 0）
+      "combo_score": {"red": 0, "black": 0}, # 已结束且达到3次的连击段累计分（v6）
       "flip_score": 24,                    # 开局四枚明子的翻棋分（v4）
       "no_capture_plies": 3,                # 连续未吃子的普通移子数；翻棋不计（v4）
       "chase_count": {"red": 2, "black": 0}, # 当前连续追同一目标次数（v3）
@@ -28,7 +29,7 @@
       "multiplier": {...}                  # 导出时附带的倍率明细，导入时忽略（按上面各项重新计算）
     }
 
-棋子类型统一用 将 仕 象 车 马 炮 兵；导入时也接受 帅 相 士 卒 等显示名。v1~v3 的未吃子计数和翻棋分口径不同，导入时重置为 0；其中存在的长捉计数会保留。v1~v4 未保存可调规则阈值，使用默认值。
+棋子类型统一用 将 仕 象 车 马 炮 兵；导入时也接受 帅 相 士 卒 等显示名。v1~v3 的未吃子计数和翻棋分口径不同，导入时重置为 0；其中存在的长捉计数会保留。v1~v4 未保存可调规则阈值，使用默认值。v1~v5 不含累计连击分，导入时最多按最高连击估算一段，无法还原重复连击。
 剩余棋子池（暗子的可能身份）= 全部棋子 − 明子 − 被吃棋子，不需要单独给出。
 """
 
@@ -37,7 +38,7 @@ from .game import (
     INITIAL_HP, PIECE_CONFIG, ROWS, Game, compute_multiplier, make_piece,
 )
 
-STATE_VERSION = 5
+STATE_VERSION = 6
 PIECE_TYPES = list(PIECE_CONFIG)  # 将 仕 象 车 马 炮 兵
 SIDES = ('red', 'black')
 SIDE_PREFIX = {'red': 'r', 'black': 'b'}
@@ -99,6 +100,7 @@ def game_to_state(game):
         'captured': {side: {t: n for t, n in captured[side].items() if n} for side in SIDES},
         'combo': dict(game.combo),
         'max_combo': dict(game.max_combo),
+        'combo_score': dict(game.combo_score),
         'flip_score': game.flip_score,
         'no_capture_plies': game.no_capture_plies,
         'chase_count': dict(game.chase_count),
@@ -194,6 +196,20 @@ def game_from_state(state):
 
     combo = _side_ints(state, 'combo')
     max_combo = _side_ints(state, 'max_combo')
+    combo_score = state.get('combo_score')
+    if combo_score is None:
+        combo_score = {
+            side: (max_combo[side] if max_combo[side] >= 3 and
+                   (combo[side] < 3 or max_combo[side] > combo[side]) else 0)
+            for side in SIDES
+        }
+    elif not isinstance(combo_score, dict):
+        raise ValueError('combo_score 必须是对象')
+    else:
+        combo_score = _side_ints(state, 'combo_score')
+    for side in SIDES:
+        if combo_score[side] < 0:
+            raise ValueError(f'combo_score.{side} 必须是非负整数')
     for side in SIDES:
         if combo[side] > max_combo[side]:
             max_combo[side] = combo[side]  # 只给了当前连击时，最高连击至少等于它
@@ -208,6 +224,7 @@ def game_from_state(state):
     game.hp = hp
     game.combo = combo
     game.max_combo = max_combo
+    game.combo_score = combo_score
     game.flip_score = flip_score
     no_capture_plies = state.get('no_capture_plies', 0)
     if not isinstance(no_capture_plies, int) or no_capture_plies < 0:
@@ -264,10 +281,10 @@ def _side_ints(state, key):
 # 前 608 维与原项目 training/encode.py 完全相同（19 通道 × 32 格），之后追加：
 #   608-621：各方被吃棋子数 / 该类型总数（red 7 种 + black 7 种，顺序 将仕象车马炮兵）
 #   622-635：剩余池（暗子可能身份）各类型数量 / 该类型总数（同上顺序）
-#   636-642：倍率相关：当前连击 红/黑 ÷5、最高连击 红/黑 ÷5、开局四子翻棋分 ÷40、血量差 ÷60、倍率 ÷500
+#   636-642：倍率相关：当前连击 红/黑 ÷5、累计达标连击分 红/黑 ÷16、开局四子翻棋分 ÷40、血量差 ÷60、倍率 ÷500
 # 原编码看不出暗子里还剩什么，追加的 28 维让模型知道“翻开大概率是什么”；
 # 倍率相关 7 维让模型能学到“领先时把倍率做大、落后时压小”。
-FEATURE_VERSION = 3
+FEATURE_VERSION = 4
 NUM_CHANNELS = 19
 BOARD_SIZE = ROWS * COLS
 BASE_SIZE = NUM_CHANNELS * BOARD_SIZE  # 608
@@ -302,7 +319,7 @@ def encode_features(game):
 
     m = game.get_multiplier()
     for v in (game.combo['red'] / 5, game.combo['black'] / 5,
-              game.max_combo['red'] / 5, game.max_combo['black'] / 5,
+              game.combo_score['red'] / 16, game.combo_score['black'] / 16,
               m['flip_score'] / MAX_FLIP_SCORE, m['hp_diff'] / INITIAL_HP, m['multiplier'] / 500):
         vec[k] = v
         k += 1

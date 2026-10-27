@@ -120,7 +120,7 @@ class Position:
     """搜索用的紧凑局面：32 格整数棋盘 + 剩余池计数 + 血量 / 连击 / 翻棋分。"""
 
     __slots__ = ('b', 'pool', 'hp', 'turn', 'cur', 'mx', 'flip', 'winner',
-                 'no_capture_plies', 'chase_count', 'chase_target',
+                 'combo_score', 'no_capture_plies', 'chase_count', 'chase_target',
                  'long_chase_limit', 'no_capture_limit')
 
     @classmethod
@@ -140,6 +140,7 @@ class Position:
         pos.turn = SIDE_KEYS.index(game.current_turn)
         pos.cur = [game.combo['red'], game.combo['black']]
         pos.mx = [game.max_combo['red'], game.max_combo['black']]
+        pos.combo_score = [game.combo_score['red'], game.combo_score['black']]
         pos.flip = game.flip_score
         pos.winner = -1 if game.winner is None else SIDE_KEYS.index(game.winner)
         pos.no_capture_plies = game.no_capture_plies
@@ -155,13 +156,14 @@ class Position:
     def key(self):
         return (tuple(self.b), tuple(self.pool), self.hp[0], self.hp[1], self.turn,
                 self.cur[0], self.cur[1], self.mx[0], self.mx[1], self.flip,
-                self.no_capture_plies, tuple(self.chase_count), tuple(self.chase_target),
+                tuple(self.combo_score), self.no_capture_plies, tuple(self.chase_count), tuple(self.chase_target),
                 self.long_chase_limit, self.no_capture_limit)
 
     # ---------------------------------------------------------- 倍率
     def combo_factor(self):
-        over = [m for m in self.mx if m > COMBO_THRESHOLD]
-        return sum(over) if over else 1
+        points = sum(self.combo_score)
+        points += sum(self.cur[s] for s in (RED, BLACK) if self.cur[s] >= COMBO_THRESHOLD)
+        return points if points > 0 else 1
 
     def hp_diff(self):
         return abs(self.hp[0] - self.hp[1])
@@ -173,10 +175,10 @@ class Position:
     def _save(self, a, c, pool_code):
         return (a, self.b[a], c, self.b[c], self.hp[0], self.hp[1], self.turn,
                 self.cur[0], self.cur[1], self.mx[0], self.mx[1], self.flip, self.winner,
-                self.no_capture_plies, tuple(self.chase_count), tuple(self.chase_target), pool_code)
+                tuple(self.combo_score), self.no_capture_plies, tuple(self.chase_count), tuple(self.chase_target), pool_code)
 
     def undo(self, u):
-        a, pa, c, pc, h0, h1, t, c0, c1, m0, m1, f, w, quiet, chase_count, chase_target, pool_code = u
+        a, pa, c, pc, h0, h1, t, c0, c1, m0, m1, f, w, combo_score, quiet, chase_count, chase_target, pool_code = u
         self.b[a] = pa
         self.b[c] = pc
         self.hp[0], self.hp[1] = h0, h1
@@ -185,6 +187,7 @@ class Position:
         self.mx[0], self.mx[1] = m0, m1
         self.flip = f
         self.winner = w
+        self.combo_score = list(combo_score)
         self.no_capture_plies = quiet
         self.chase_count = list(chase_count)
         self.chase_target = list(chase_target)
@@ -195,6 +198,11 @@ class Position:
         self.cur[me] += 1
         if self.cur[me] > self.mx[me]:
             self.mx[me] = self.cur[me]
+
+    def _break_combo(self, me):
+        if self.cur[me] >= COMBO_THRESHOLD:
+            self.combo_score[me] += self.cur[me]
+        self.cur[me] = 0
 
     def _check_over(self):
         # 与 Game.move_piece 一致：先判红方
@@ -213,10 +221,13 @@ class Position:
         b[a] = EMPTY
         if q:
             self.hp[SIDE[q]] -= HPC[q]
-            self._hit(me)
+            if SIDE[q] != me:
+                self._hit(me)
+            else:
+                self._break_combo(me)
             self._check_over()
         else:
-            self.cur[me] = 0
+            self._break_combo(me)
         self.no_capture_plies = 0 if q else self.no_capture_plies + 1
         opponent = me ^ 1
         if q:
@@ -271,7 +282,7 @@ class Position:
         self.pool[code] -= 1
         self.chase_count[self.turn] = 0
         self.chase_target[self.turn] = -1
-        self.cur[self.turn] = 0
+        self._break_combo(self.turn)
         self.turn ^= 1
         return u
 
@@ -280,7 +291,7 @@ class Position:
         u = self._save(sq, sq, 0)
         self.chase_count[self.turn] = 0
         self.chase_target[self.turn] = -1
-        self.cur[self.turn] = 0
+        self._break_combo(self.turn)
         self.turn ^= 1
         return u
 
@@ -292,7 +303,10 @@ class Position:
         self.hp[SIDE[code]] -= HPC[code]
         self.b[c] = self.b[a]
         self.b[a] = EMPTY
-        self._hit(me)
+        if SIDE[code] != me:
+            self._hit(me)
+        else:
+            self._break_combo(me)
         self._check_over()
         self.no_capture_plies = 0
         opponent = me ^ 1

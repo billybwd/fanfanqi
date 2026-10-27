@@ -500,10 +500,10 @@ class App:
 
         m = g.get_multiplier()
         self.mult_var.set(f"{m['multiplier']} = 连击系数 {m['combo_factor']} ×（翻棋 {m['flip_score']} + 血量差 {m['hp_diff']}）")
-        # 3 连击及以下不算连击，只显示计入系数的连击
-        counted = [f"{'红' if s == 'red' else '黑'}方最高 {g.max_combo[s]} 连击"
-                   for s in ('red', 'black') if g.max_combo[s] > COMBO_THRESHOLD]
-        self.combo_var.set('连击：' + ('、'.join(counted) if counted else '无（3 连击及以下不计）'))
+        # 每段达到 3 次的连击都累计；当前连击段达到 3 次后实时计入。
+        counted = [f"{'红' if s == 'red' else '黑'}方 {m['combo_points'][s]} 分"
+                   for s in ('red', 'black') if m['combo_points'][s] > 0]
+        self.combo_var.set('累计连击：' + (' + '.join(counted) if counted else '无（尚无 3 连击）'))
 
         captured = captured_pieces(g)
         for side in ('red', 'black'):
@@ -729,7 +729,7 @@ class App:
         mover = g.current_turn
         if g.move_piece(fr, fc, tr, tc, idx):
             line = f'{SIDE_NAMES[mover]} {describe_last_action(g.last_action)}'
-            if g.combo[mover] > COMBO_THRESHOLD:
+            if g.combo[mover] >= COMBO_THRESHOLD:
                 line += f' · {g.combo[mover]}连击'
             self.move_log.append(line)
             self.after_action()

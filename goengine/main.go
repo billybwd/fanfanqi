@@ -92,6 +92,7 @@ type Position struct {
 	HP [2]float64
 	Turn int
 	Cur, Max [2]int
+	ComboScore [2]int
 	Flip float64
 	Winner int
 	NoCapturePlies int
@@ -106,6 +107,7 @@ type Undo struct {
 	HP [2]float64
 	Turn int
 	Cur, Max [2]int
+	ComboScore [2]int
 	Flip float64
 	Winner int
 	NoCapturePlies int
@@ -120,6 +122,7 @@ type State struct {
 	Captured map[string]map[string]int `json:"captured"`
 	Combo map[string]int `json:"combo"`
 	MaxCombo map[string]int `json:"max_combo"`
+	ComboScore map[string]int `json:"combo_score"`
 	FlipScore float64 `json:"flip_score"`
 	NoCapturePlies int `json:"no_capture_plies"`
 	ChaseCount map[string]int `json:"chase_count"`
@@ -180,6 +183,7 @@ func parsePosition(s State) (Position, error) {
 		if hp, ok := s.HP[key]; ok { p.HP[side] = hp } else { p.HP[side] = 60 }
 		if s.Combo != nil { p.Cur[side] = s.Combo[key] }
 		if s.MaxCombo != nil { p.Max[side] = s.MaxCombo[key] }
+		if s.ComboScore != nil { p.ComboScore[side] = s.ComboScore[key] } else if p.Max[side] >= 3 && (p.Cur[side] < 3 || p.Max[side] > p.Cur[side]) { p.ComboScore[side] = p.Max[side] }
 		for typ, name := range pieceTypes {
 			captured := 0
 			if s.Captured != nil && s.Captured[key] != nil { captured = s.Captured[key][name] }
@@ -243,22 +247,24 @@ func (p *Position) captures() []Move {
 	return caps
 }
 func (p *Position) save(a,c,poolCode int) Undo {
-	return Undo{A:a,C:c,PA:p.B[a],PC:p.B[c],HP:p.HP,Turn:p.Turn,Cur:p.Cur,Max:p.Max,Flip:p.Flip,Winner:p.Winner,NoCapturePlies:p.NoCapturePlies,ChaseCount:p.ChaseCount,ChaseTarget:p.ChaseTarget,PoolCode:poolCode}
+	return Undo{A:a,C:c,PA:p.B[a],PC:p.B[c],HP:p.HP,Turn:p.Turn,Cur:p.Cur,Max:p.Max,ComboScore:p.ComboScore,Flip:p.Flip,Winner:p.Winner,NoCapturePlies:p.NoCapturePlies,ChaseCount:p.ChaseCount,ChaseTarget:p.ChaseTarget,PoolCode:poolCode}
 }
 func (p *Position) undo(u Undo) {
 	p.B[u.A], p.B[u.C] = u.PA, u.PC
 	p.HP, p.Turn, p.Cur, p.Max, p.Flip, p.Winner = u.HP, u.Turn, u.Cur, u.Max, u.Flip, u.Winner
+	p.ComboScore = u.ComboScore
 	p.NoCapturePlies, p.ChaseCount, p.ChaseTarget = u.NoCapturePlies, u.ChaseCount, u.ChaseTarget
 	if u.PoolCode > 0 { p.Pool[u.PoolCode]++ }
 }
 func (p *Position) hit(side int) { p.Cur[side]++; if p.Cur[side] > p.Max[side] { p.Max[side] = p.Cur[side] } }
+func (p *Position) breakCombo(side int) { if p.Cur[side] >= 3 { p.ComboScore[side] += p.Cur[side] }; p.Cur[side] = 0 }
 func (p *Position) checkOver() {
 	if p.HP[red] <= 0 { p.Winner = black } else if p.HP[black] <= 0 { p.Winner = red }
 }
 func (p *Position) doMove(a,c int) Undo {
 	u := p.save(a,c,0); attacker, target := int(p.B[a]), int(p.B[c]); p.B[c],p.B[a] = p.B[a],empty
-	if target != empty { p.HP[sideOf[target]] -= float64(hpc[target]); p.hit(p.Turn); p.checkOver()
-	} else { p.Cur[p.Turn] = 0 }
+	if target != empty { p.HP[sideOf[target]] -= float64(hpc[target]); if sideOf[target] != p.Turn { p.hit(p.Turn) } else { p.breakCombo(p.Turn) }; p.checkOver()
+	} else { p.breakCombo(p.Turn) }
 	me, opponent := p.Turn, p.Turn^1
 	if target == empty { p.NoCapturePlies++ } else { p.NoCapturePlies = 0 }
 	if target != empty {
@@ -286,14 +292,14 @@ func (p *Position) captureTargetsFrom(sq, side int) []int {
 	return targets
 }
 func (p *Position) doFlip(sq, code int) Undo {
-	u := p.save(sq,sq,code); p.B[sq] = int8(code); p.Pool[code]--; p.ChaseCount[p.Turn],p.ChaseTarget[p.Turn]=0,-1; p.Cur[p.Turn] = 0; p.Turn ^= 1; return u
+	u := p.save(sq,sq,code); p.B[sq] = int8(code); p.Pool[code]--; p.ChaseCount[p.Turn],p.ChaseTarget[p.Turn]=0,-1; p.breakCombo(p.Turn); p.Turn ^= 1; return u
 }
 func (p *Position) doFlipApprox(sq int) Undo {
-	u := p.save(sq,sq,0); p.ChaseCount[p.Turn],p.ChaseTarget[p.Turn]=0,-1; p.Cur[p.Turn] = 0; p.Turn ^= 1; return u
+	u := p.save(sq,sq,0); p.ChaseCount[p.Turn],p.ChaseTarget[p.Turn]=0,-1; p.breakCombo(p.Turn); p.Turn ^= 1; return u
 }
 func (p *Position) doHiddenCapture(a,c,code int) Undo {
 	u := p.save(a,c,code); p.Pool[code]--; p.HP[sideOf[code]] -= float64(hpc[code]); p.B[c] = p.B[a]; p.B[a] = empty
-	me,opponent:=p.Turn,p.Turn^1; p.hit(me); p.checkOver(); p.NoCapturePlies=0; if p.ChaseTarget[opponent]==a {p.ChaseTarget[opponent]=c}; p.ChaseTarget[me],p.ChaseCount[me]=-1,0; p.Turn ^= 1; return u
+	me,opponent:=p.Turn,p.Turn^1; if sideOf[code] != me { p.hit(me) } else { p.breakCombo(me) }; p.checkOver(); p.NoCapturePlies=0; if p.ChaseTarget[opponent]==a {p.ChaseTarget[opponent]=c}; p.ChaseTarget[me],p.ChaseCount[me]=-1,0; p.Turn ^= 1; return u
 }
 func (p *Position) attacked(sq, piece int) bool {
 	enemy := sideOf[piece]^1
@@ -305,7 +311,7 @@ func (p *Position) cannonHits(from,target int) bool {
 	for _, ray := range rays[from] { mounted:=false; for _, n:=range ray { if p.B[n]==empty {continue}; if !mounted {mounted=true;continue}; if n==target {return true}; break } }
 	return false
 }
-func (p *Position) comboFactor() int { total:=0; for _,m:=range p.Max {if m>3 {total+=m}}; if total==0{return 1}; return total }
+func (p *Position) comboFactor() int { total:=p.ComboScore[red]+p.ComboScore[black]; for side:=0;side<2;side++{if p.Cur[side]>=3{total+=p.Cur[side]}}; if total==0{return 1}; return total }
 func (p *Position) hpDiff() float64 { return math.Abs(p.HP[red]-p.HP[black]) }
 func (p *Position) multiplier() float64 { return float64(p.comboFactor())*(p.Flip+p.hpDiff()) }
 
@@ -387,7 +393,7 @@ func (s *Searcher) orderedMoves(p *Position,ply int,ttBest Move,hasTT bool) []Mo
 }
 
 func (p *Position) key() uint64 {
-	h:=uint64(1469598103934665603);mix:=func(v uint64){h^=v;h*=1099511628211};for _,v:=range p.B{mix(uint64(v))};for _,v:=range p.Pool{mix(uint64(v))};for _,v:=range p.HP{mix(math.Float64bits(v))};mix(uint64(p.Turn));for _,v:=range p.Cur{mix(uint64(v))};for _,v:=range p.Max{mix(uint64(v))};mix(math.Float64bits(p.Flip));mix(uint64(p.Winner+1));mix(uint64(p.NoCapturePlies));for _,v:=range p.ChaseCount{mix(uint64(v))};for _,v:=range p.ChaseTarget{mix(uint64(v+1))};mix(uint64(p.LongChaseLimit));mix(uint64(p.NoCaptureLimit));return h
+	h:=uint64(1469598103934665603);mix:=func(v uint64){h^=v;h*=1099511628211};for _,v:=range p.B{mix(uint64(v))};for _,v:=range p.Pool{mix(uint64(v))};for _,v:=range p.HP{mix(math.Float64bits(v))};mix(uint64(p.Turn));for _,v:=range p.Cur{mix(uint64(v))};for _,v:=range p.Max{mix(uint64(v))};for _,v:=range p.ComboScore{mix(uint64(v))};mix(math.Float64bits(p.Flip));mix(uint64(p.Winner+1));mix(uint64(p.NoCapturePlies));for _,v:=range p.ChaseCount{mix(uint64(v))};for _,v:=range p.ChaseTarget{mix(uint64(v+1))};mix(uint64(p.LongChaseLimit));mix(uint64(p.NoCaptureLimit));return h
 }
 
 func (s *Searcher) chanceWeights(p *Position) map[int]float64 {

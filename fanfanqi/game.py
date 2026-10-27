@@ -40,22 +40,28 @@ DEFAULT_NO_CAPTURE_LIMIT = 16
 # 倍率规则：倍率 = 连击系数 × (翻棋分 + 血量差)
 # 翻棋分：只累计开局放置的 4 枚明子；之后翻子和炮打暗子不计分
 FLIP_SCORE = {'兵': 2, '车': 4, '马': 4, '炮': 6, '象': 4, '仕': 8, '将': 12}
-# 连击：同一方连续自己的回合都吃到子（含炮打暗子）；某回合没吃子则清零。
-# 双方最高连击都不超过该值时连击系数为 1；一方超过取该方最高连击；双方都超过取两者之和
+# 连击：同一方连续自己的回合都吃到对方棋子（炮打暗子仅翻出对方棋子时算）；否则清零。
+# 每段达到阈值的连击都计入该方累计分；双方累计分相加，尚无达标连击时系数为 1
 COMBO_THRESHOLD = 3
 
 
-def combo_factor(max_combo_red, max_combo_black):
-    over = [c for c in (max_combo_red, max_combo_black) if c > COMBO_THRESHOLD]
-    return sum(over) if over else 1
+def combo_factor(combo_points_red, combo_points_black):
+    points = combo_points_red + combo_points_black
+    return points if points > 0 else 1
 
 
-def compute_multiplier(hp, max_combo, flip_score):
+def compute_multiplier(hp, combo_score, flip_score, combo=None):
     """返回倍率及各组成部分；血量差使用双方原始 HP，允许失败方为负数。"""
-    factor = combo_factor(max_combo['red'], max_combo['black'])
+    combo_points = dict(combo_score)
+    if combo:
+        for side in ('red', 'black'):
+            if combo[side] >= COMBO_THRESHOLD:
+                combo_points[side] += combo[side]
+    factor = combo_factor(combo_points['red'], combo_points['black'])
     hp_diff = abs(hp['red'] - hp['black'])
     return {
         'combo_factor': factor,
+        'combo_points': combo_points,
         'flip_score': flip_score,
         'hp_diff': hp_diff,
         'multiplier': factor * (flip_score + hp_diff),
@@ -112,6 +118,7 @@ class Game:
         self.setup_index = 0
         self.combo = {'red': 0, 'black': 0}       # 当前连击
         self.max_combo = {'red': 0, 'black': 0}   # 本局最高连击
+        self.combo_score = {'red': 0, 'black': 0} # 已结束的达标连击段分数
         self.flip_score = 0
         self.no_capture_plies = 0
         self.chase_count = {'red': 0, 'black': 0}
@@ -142,6 +149,7 @@ class Game:
             'remaining_pool': [dict(p) for p in self.remaining_pool],
             'combo': dict(self.combo),
             'max_combo': dict(self.max_combo),
+            'combo_score': dict(self.combo_score),
             'flip_score': self.flip_score,
             'no_capture_plies': self.no_capture_plies,
             'chase_count': dict(self.chase_count),
@@ -160,6 +168,7 @@ class Game:
         self.remaining_pool = [dict(p) for p in snapshot['remaining_pool']]
         self.combo = dict(snapshot['combo'])
         self.max_combo = dict(snapshot['max_combo'])
+        self.combo_score = dict(snapshot.get('combo_score', {'red': 0, 'black': 0}))
         self.flip_score = snapshot['flip_score']
         self.no_capture_plies = snapshot.get('no_capture_plies', 0)
         self.chase_count = dict(snapshot.get('chase_count', {'red': 0, 'black': 0}))
@@ -167,7 +176,7 @@ class Game:
         self._face_up_cache = {}
 
     def get_multiplier(self):
-        return compute_multiplier(self.hp, self.max_combo, self.flip_score)
+        return compute_multiplier(self.hp, self.combo_score, self.flip_score, self.combo)
 
     def _record_turn_combo(self, side, captured):
         if captured:
@@ -175,6 +184,8 @@ class Game:
             if self.combo[side] > self.max_combo[side]:
                 self.max_combo[side] = self.combo[side]
         else:
+            if self.combo[side] >= COMBO_THRESHOLD:
+                self.combo_score[side] += self.combo[side]
             self.combo[side] = 0
 
     def clone(self):
@@ -458,7 +469,8 @@ class Game:
         self._face_up_cache = {}
         self.no_capture_plies = 0 if captured else self.no_capture_plies + 1
         self._advance_chase(mover_side, from_row, from_col, to_row, to_col, captured, captured_visible)
-        self._record_turn_combo(piece['side'], target is not None)
+        captured_opponent = bool(target and target['side'] != piece['side'])
+        self._record_turn_combo(piece['side'], captured_opponent)
 
         # 判断胜负
         if self.hp['red'] <= 0:
