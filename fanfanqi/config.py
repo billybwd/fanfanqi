@@ -67,6 +67,10 @@ def load_config(path=CONFIG_PATH):
             loaded = json.load(f)
     except (OSError, ValueError):
         loaded = {}
+    v16 = loaded.get('v16') if isinstance(loaded, dict) else None
+    if isinstance(v16, dict) and 'objective' in v16 and 'multiplier_exponent' not in v16:
+        # 旧版 'reward' / 'win' 换算成 λ
+        v16['multiplier_exponent'] = 0.0 if v16['objective'] == 'win' else 1.0
     return _merge(DEFAULT_CONFIG, loaded)
 
 

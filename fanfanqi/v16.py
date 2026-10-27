@@ -6,9 +6,10 @@
 2. 评估函数只有一组有名字的权重（见 DEFAULT_PARAMS['weights']），便于手调和自动调参，
    这些评估项之后也可以直接作为机器学习特征。
 3. 战术交给搜索：Alpha-Beta + 只看吃子的静态搜索，不再有绕过搜索的规则覆盖。
-4. 目标函数可选：
-   - 'reward'（默认）：最大化“胜负 × 倍率”的期望。领先时倾向把倍率做大，落后时倾向压小；
-   - 'win'：只追求胜率。
+4. 目标函数连续可调：局面价值 = (2p − 1) × 倍率^λ，结果为负时再乘 κ。
+   - λ = 1（默认）：最大化“胜负 × 倍率”的期望。领先时倾向把倍率做大，落后时倾向压小；
+   - λ = 0：只追求胜率（同样赢时仍略偏好大倍率）；介于两者之间即“优先赢，兼顾倍率”；
+   - κ > 1：厌恶损失，更看重少输而不是多赢。
 5. 整数棋盘 + 原地走子/撤销，比基于 dict 的 Game 快得多。
 """
 
@@ -18,8 +19,10 @@ import time
 from .game import COLS, COMBO_THRESHOLD, FLIP_SCORE, PIECE_CONFIG, ROWS
 
 DEFAULT_PARAMS = {
-    # 'reward'：最大化 胜负×倍率 的期望；'win'：只看胜率
-    'objective': 'reward',
+    # λ：局面价值 = (2p − 1) × 倍率^λ。1 = 最大化 胜负×倍率 的期望；0 = 只看胜率；中间值兼顾
+    'multiplier_exponent': 1.0,
+    # κ：价值为负（预计输）时乘的系数。1 = 风险中性；>1 = 更看重少输
+    'loss_aversion': 1.0,
     # 估算终局倍率时，剩余暗子的翻棋分按多大比例计入（假设其中多少会被手动翻开）
     'future_flip_factor': 0.5,
     # 评估分（HP 单位）换算胜率的温度：胜率 = sigmoid(评估分 / 温度)
@@ -346,7 +349,8 @@ class Searcher:
         w = params['weights']
         self.w = w
         self.pv = [w['piece_value'][t] for t in TYPES]
-        self.reward = params['objective'] == 'reward'
+        self.lam = params['multiplier_exponent']
+        self.kappa = params['loss_aversion']
         self.tt = {}
         self.nodes = 0
         self.deadline = INF
@@ -422,18 +426,21 @@ class Searcher:
         m = pos.combo_factor() * (pos.flip + self.p['future_flip_factor'] * pos.pool_flip_sum() + pos.hp_diff())
         return max(1.0, m)
 
+    def _objective(self, v, multiplier):
+        """胜负期望 v ∈ [−1, 1] 换算成目标值：v × 倍率^λ，为负时再乘 κ。"""
+        v *= multiplier ** self.lam
+        return v * self.kappa if v < 0 else v
+
     def leaf_value(self, pos):
         x = self.static_eval(pos) / self.p['win_temperature']
         x = max(-30.0, min(30.0, x))
-        v = 2.0 / (1.0 + math.exp(-x)) - 1.0
-        if self.reward:
-            v *= self.est_multiplier(pos)
-        return v
+        return self._objective(2.0 / (1.0 + math.exp(-x)) - 1.0, self.est_multiplier(pos))
 
     def terminal_value(self, pos, ply):
-        m = max(1, pos.multiplier()) if self.reward else 1.0
-        v = m * (1.0 - 0.001 * ply)  # 同等结果下越快越好
-        return v if pos.winner == pos.turn else -v
+        m = max(1, pos.multiplier())
+        # 同等结果下越快越好；λ 很小时用 log(倍率) 区分“赢得多”和“赢得少”（不超过叶子估值的上界）
+        v = (1.0 + 0.01 * math.log(m)) * (1.0 - 0.001 * ply)
+        return self._objective(v if pos.winner == pos.turn else -v, m)
 
     # -------------------------------------------------------- 排序
     def _quiet_score(self, pos, a, c):
@@ -654,8 +661,10 @@ class Searcher:
         info = {'source': 'search', 'depth': depth_done, 'score': best_value, 'nodes': self.nodes,
                 'multiplier': pos.multiplier()}
         if best_value is not None:
-            scale = self.est_multiplier(pos) if self.reward else 1.0
-            info['win_prob'] = max(0.0, min(1.0, (best_value / scale + 1) / 2))
+            v = best_value / self.est_multiplier(pos) ** self.lam
+            if v < 0:
+                v /= self.kappa
+            info['win_prob'] = max(0.0, min(1.0, (v + 1) / 2))
         return best, info
 
 
@@ -681,6 +690,9 @@ def merge_params(overrides):
                     params['weights']['piece_value'].update(wv)
                 else:
                     params['weights'][wk] = wv
+        elif k == 'objective':  # 旧版配置：'reward' / 'win'
+            if 'multiplier_exponent' not in overrides:
+                params['multiplier_exponent'] = 0.0 if v == 'win' else 1.0
         else:
             params[k] = v
     return params

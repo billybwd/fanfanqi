@@ -44,11 +44,19 @@ class RandomAI:
 
 
 def make_player(name, side, budget_ms):
-    """name 可写成 StrategicV16AI:win，冒号后为 V16 的目标函数（reward / win）。"""
+    """name 可写成 StrategicV16AI:λ 或 StrategicV16AI:λ,κ（如 StrategicV16AI:0.5,1.5），
+    冒号后为 V16 的 multiplier_exponent / loss_aversion；也接受旧写法 :reward / :win。"""
     if name == 'random':
         return RandomAI(side)
     model, _, objective = name.partition(':')
-    v16_params = {'objective': objective} if objective else None
+    v16_params = None
+    if objective in ('reward', 'win'):
+        v16_params = {'objective': objective}
+    elif objective:
+        lam, _, kappa = objective.partition(',')
+        v16_params = {'multiplier_exponent': float(lam)}
+        if kappa:
+            v16_params['loss_aversion'] = float(kappa)
     return create_ai(model, side, budget_ms, v16_params=v16_params)
 
 

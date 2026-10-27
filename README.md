@@ -110,9 +110,11 @@ V16 重新写了一个结构简单、便于调参和接入机器学习的基线�
 - **约 15 个有名字的评估权重**（`config.json` → `v16.weights`）：HP 差、明子战斗力、机动性、
   被威胁的棋子、未翻出的己方棋子、将的安全（敌兵距离、瞄将的炮、可逃格）、先手。
 - **全部决策经过搜索**：迭代加深 Alpha-Beta + 只看吃子的静态搜索 + 置换表，没有规则覆盖。
-- **目标函数**（`v16.objective`）：`"reward"` 最大化“胜负 × 倍率”的期望——估算胜率
-  p = sigmoid(评估分 / `win_temperature`)，局面价值 = (2p − 1) × 预估终局倍率，
-  所以领先时倾向把倍率做大，落后时倾向压小；`"win"` 只追求胜率。
+- **目标函数**（`v16.multiplier_exponent` = λ，`v16.loss_aversion` = κ）：估算胜率
+  p = sigmoid(评估分 / `win_temperature`)，局面价值 = (2p − 1) × 预估终局倍率^λ，结果为负时再乘 κ。
+  λ = 1 最大化“胜负 × 倍率”的期望（领先时倾向把倍率做大，落后时倾向压小）；λ = 0 只追求胜率
+  （同样能赢时仍略偏好大倍率）；0.3～0.5 即“优先赢，兼顾倍率”。κ > 1 更看重少输。
+  旧配置里的 `objective: "reward" / "win"` 会自动换算成 λ = 1 / 0。
   预估终局倍率 = 连击系数 × (翻棋分 + `future_flip_factor` × 剩余暗子的翻棋分 + 血量差)。
 - **整数棋盘 + 原地走子/撤销**，与 `Game` 的规则经 4900 多个局面逐项比对一致（着法生成、HP、连击、倍率）。
 
@@ -120,7 +122,8 @@ V16 重新写了一个结构简单、便于调参和接入机器学习的基线�
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `objective` | `"reward"` | `"reward"` 按倍率期望 / `"win"` 只看胜负 |
+| `multiplier_exponent` | `1.0` | λ：1 按倍率期望 / 0 只看胜负 / 中间值兼顾 |
+| `loss_aversion` | `1.0` | κ：预计输时的放大系数，>1 更看重少输 |
 | `future_flip_factor` | `0.5` | 估算终局倍率时，剩余暗子的翻棋分计入多少 |
 | `win_temperature` | `12` | 评估分换算胜率的温度，越大胜率越保守 |
 | `max_depth` | `8` | 迭代加深最大层数（通常先被思考时间限制） |
@@ -141,11 +144,12 @@ V16 重新写了一个结构简单、便于调参和接入机器学习的基线�
 按倍率算的净得分反而略低于只看胜负的版本——说明“为做大倍率而冒的险”目前偏多，
 `future_flip_factor`、`win_temperature` 等参数还需要调。30 局样本仍有随机误差。
 
-运行基准（命令行用 `StrategicV16AI:win` 指定只看胜负的版本）：
+运行基准（命令行用 `StrategicV16AI:λ` 或 `StrategicV16AI:λ,κ` 指定目标参数，`:win` 等同 `:0`）：
 
 ```bash
 python -m tests.selfplay StrategicV16AI StrategicV15AI 30 0.5
-python -m tests.selfplay StrategicV16AI:win StrategicV15AI 30 0.5
+python -m tests.selfplay StrategicV16AI:0 StrategicV15AI 30 0.5
+python -m tests.selfplay StrategicV16AI:0.5,1.5 StrategicV16AI:1 30 0.5
 ```
 
 ## 关于“模型”：目前没有训练出来的模型
