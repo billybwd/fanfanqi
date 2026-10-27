@@ -4,8 +4,8 @@
 与 AI 搜索时假设的 pool_index 无关 —— 这正是“AI 只给提示”时的真实情况。
 
 用法：
-    python -m tests.selfplay                       # 规则测试 + 冒烟测试
-    python -m tests.selfplay StrategicV15AI random 10 0.3   # 对弈基准：A B 局数 每步秒数
+    python -m tests.selfplay                       # 规则测试 + AI 合法性 + V17 自对弈
+    python -m tests.selfplay StrategicV17AI StrategicV16AI 10 0.3  # 新旧策略基准
 """
 
 import random
@@ -49,15 +49,17 @@ def make_player(name, side, budget_ms):
     if name == 'random':
         return RandomAI(side)
     model, _, objective = name.partition(':')
-    v16_params = None
+    strategy_params = None
     if objective in ('reward', 'win'):
-        v16_params = {'objective': objective}
+        strategy_params = {'objective': objective}
     elif objective:
         lam, _, kappa = objective.partition(',')
-        v16_params = {'multiplier_exponent': float(lam)}
+        strategy_params = {'multiplier_exponent': float(lam)}
         if kappa:
-            v16_params['loss_aversion'] = float(kappa)
-    return create_ai(model, side, budget_ms, v16_params=v16_params)
+            strategy_params['loss_aversion'] = float(kappa)
+    if model == 'StrategicV17AI':
+        return create_ai(model, side, budget_ms, v17_params=strategy_params)
+    return create_ai(model, side, budget_ms, v16_params=strategy_params)
 
 
 def play_game(red_name, black_name, budget_ms=300, max_plies=300):
@@ -152,9 +154,9 @@ def run_tests():
             all(action.get(k) == a.get(k) for k in a) for a in base.get_all_actions())
         check(f'{name} 返回合法动作（{(time.perf_counter() - t) * 1000:.0f}ms）', legal)
 
-    print('V15 完整自对弈（随机翻子）')
+    print('V17 完整自对弈（随机翻子）')
     for _ in range(2):
-        winner, plies, _ = play_game('StrategicV15AI', 'StrategicV15AI', 150)
+        winner, plies, _ = play_game('StrategicV17AI', 'StrategicV17AI', 150)
         check(f'对局完整结束：{winner}，{plies} 步', winner in ('red', 'black', 'draw') and plies > 0)
 
     print(f'\n{"全部通过" if failures == 0 else f"{failures} 项失败"}')

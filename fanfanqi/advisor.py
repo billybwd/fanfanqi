@@ -9,16 +9,28 @@ import time
 from . import ai as ai_module
 from .game import PIECE_NAMES, SIDE_NAMES
 from .v16 import StrategicV16AI
+from .v17 import StrategicV17AI
 
-AI_MODELS = ['SimpleAI'] + [f'StrategicV{i}AI' for i in range(2, 17)]
-DEFAULT_MODEL = 'StrategicV16AI'
+AI_MODELS = ['SimpleAI'] + [f'StrategicV{i}AI' for i in range(2, 18)]
+DEFAULT_MODEL = 'StrategicV17AI'
 # 每步默认思考时间（原版 V15 在浏览器中为 900ms，Python 较慢，给多一些）
 DEFAULT_TIME_BUDGET_MS = 2500
 
 
-def create_ai(model_name, side, time_budget_ms=DEFAULT_TIME_BUDGET_MS, search_params=None, v16_params=None):
+def create_ai(model_name, side, time_budget_ms=DEFAULT_TIME_BUDGET_MS, search_params=None, v16_params=None,
+              v17_params=None, engine='python', threads=1):
+    if engine == 'go':
+        if model_name not in ('StrategicV16AI', 'StrategicV17AI'):
+            raise ValueError('Go 引擎目前支持 StrategicV16AI 和 StrategicV17AI')
+        from .go_engine import GoEngineAI
+        params = v17_params if model_name == 'StrategicV17AI' else v16_params
+        return GoEngineAI(model_name, side, time_budget_ms, params, threads)
     if model_name == 'StrategicV16AI':
         player = StrategicV16AI(side, v16_params)
+        player.time_budget_ms = time_budget_ms
+        return player
+    if model_name == 'StrategicV17AI':
+        player = StrategicV17AI(side, v17_params)
         player.time_budget_ms = time_budget_ms
         return player
     cls = getattr(ai_module, model_name)
@@ -81,7 +93,7 @@ def describe_last_action(last_action):
 
 
 def compute_hint(game, model_name=DEFAULT_MODEL, time_budget_ms=DEFAULT_TIME_BUDGET_MS, search_params=None,
-                 v16_params=None):
+                 v16_params=None, v17_params=None, engine='python', threads=1):
     """为当前行动方计算一条提示。
 
     在对局的副本上搜索，原对局不受影响（可在后台线程调用）。
@@ -89,7 +101,8 @@ def compute_hint(game, model_name=DEFAULT_MODEL, time_budget_ms=DEFAULT_TIME_BUD
     """
     side = game.current_turn
     work = game.clone()
-    player = create_ai(model_name, side, time_budget_ms, search_params, v16_params)
+    player = create_ai(model_name, side, time_budget_ms, search_params, v16_params, v17_params,
+                       engine, threads)
     start = time.perf_counter()
     action = player.get_move(work)
     elapsed_ms = (time.perf_counter() - start) * 1000

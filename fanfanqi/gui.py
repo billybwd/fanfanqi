@@ -15,7 +15,10 @@ from tkinter import filedialog, messagebox, ttk
 
 from .advisor import AI_MODELS, compute_hint, describe_last_action, pos_text
 from .config import load_config, save_config
-from .game import COLS, COMBO_THRESHOLD, INITIAL_HP, PIECE_CONFIG, PIECE_NAMES, ROWS, SIDE_NAMES, Game, other_side
+from .game import (
+    COLS, COMBO_THRESHOLD, DEFAULT_LONG_CHASE_LIMIT, DEFAULT_NO_CAPTURE_LIMIT,
+    INITIAL_HP, PIECE_CONFIG, PIECE_NAMES, ROWS, SIDE_NAMES, Game, other_side,
+)
 from .state import captured_pieces, game_from_state, game_to_state, lost_hp
 
 CELL = 72
@@ -101,7 +104,12 @@ class App:
         cfg = self.config
         self.mode_var = tk.StringVar(value=MODE_LABELS.get(cfg['mode'], MODE_LABELS['record']))
         self.player_side_var = tk.StringVar(value=SIDE_NAMES.get(cfg['player_side'], SIDE_NAMES['red']))
-        self.model_var = tk.StringVar(value=cfg['ai_model'] if cfg['ai_model'] in AI_MODELS else 'StrategicV16AI')
+        self.model_var = tk.StringVar(value=cfg['ai_model'] if cfg['ai_model'] in AI_MODELS else 'StrategicV17AI')
+        self.engine_var = tk.StringVar(value='Go' if cfg.get('engine') == 'go' else 'Python')
+        self.threads_var = tk.IntVar(value=min(64, max(1, int(cfg.get('go_threads', 4)))))
+        rules = cfg.get('rules', {})
+        self.long_chase_var = tk.IntVar(value=max(2, int(rules.get('long_chase_limit', DEFAULT_LONG_CHASE_LIMIT))))
+        self.no_capture_var = tk.IntVar(value=max(1, int(rules.get('no_capture_limit', DEFAULT_NO_CAPTURE_LIMIT))))
         self.budget_var = tk.DoubleVar(value=cfg['think_time_sec'])
         self.hint_side_var = tk.StringVar(value=HINT_SIDE_LABELS.get(cfg['hint_side'], '双方'))
         self.show_on_board_var = tk.BooleanVar(value=cfg['show_hint_on_board'])
@@ -145,12 +153,52 @@ class App:
         cfg['mode'] = self.mode
         cfg['player_side'] = self.player_side
         cfg['ai_model'] = self.model_var.get()
+        cfg['engine'] = 'go' if self.engine_var.get() == 'Go' else 'python'
+        try:
+            cfg['go_threads'] = min(64, max(1, int(self.threads_var.get())))
+        except (tk.TclError, ValueError):
+            cfg['go_threads'] = 4
+        try:
+            cfg['rules'] = {
+                'long_chase_limit': min(20, max(2, int(self.long_chase_var.get()))),
+                'no_capture_limit': min(100, max(1, int(self.no_capture_var.get()))),
+            }
+        except (tk.TclError, ValueError):
+            cfg['rules'] = {
+                'long_chase_limit': DEFAULT_LONG_CHASE_LIMIT,
+                'no_capture_limit': DEFAULT_NO_CAPTURE_LIMIT,
+            }
         cfg['think_time_sec'] = self.think_budget_ms() / 1000
         cfg['hint_side'] = _key_of(HINT_SIDE_LABELS, self.hint_side_var.get())
         cfg['show_hint_on_board'] = bool(self.show_on_board_var.get())
         save_config(cfg)
 
     def on_setting_changed(self, _event=None):
+        self.save_settings()
+        self.request_ai()
+
+    def on_rule_setting_changed(self, _event=None):
+        self.save_settings()
+        was_over = self.game.phase == 'over'
+        self.game.configure_rules(**self.config['rules'])
+        if not was_over and self.game.phase == 'over':
+            self.after_action()
+        else:
+            self.request_ai()
+
+    def update_engine_widgets(self):
+        if self.engine_var.get() == 'Go':
+            models = ['StrategicV16AI', 'StrategicV17AI']
+            if self.model_var.get() not in models:
+                self.model_var.set('StrategicV17AI')
+            self.threads_spin.configure(state='normal')
+        else:
+            models = AI_MODELS
+            self.threads_spin.configure(state='disabled')
+        self.model_box.configure(values=models)
+
+    def on_engine_changed(self, _event=None):
+        self.update_engine_widgets()
         self.save_settings()
         self.request_ai()
 
@@ -237,10 +285,34 @@ class App:
         self.player_side_box.grid(row=row, column=1, sticky='w', pady=2)
         self.player_side_box.bind('<<ComboboxSelected>>', self.on_mode_changed)
         row += 1
-        ttk.Label(cfg, text='AI 模型').grid(row=row, column=0, sticky='w')
-        model_box = ttk.Combobox(cfg, textvariable=self.model_var, values=AI_MODELS, state='readonly', width=18)
-        model_box.grid(row=row, column=1, sticky='w', pady=2)
-        model_box.bind('<<ComboboxSelected>>', self.on_setting_changed)
+        ttk.Label(cfg, text='策略版本 / 模型').grid(row=row, column=0, sticky='w')
+        self.model_box = ttk.Combobox(cfg, textvariable=self.model_var, values=AI_MODELS, state='readonly', width=18)
+        self.model_box.grid(row=row, column=1, sticky='w', pady=2)
+        self.model_box.bind('<<ComboboxSelected>>', self.on_setting_changed)
+        row += 1
+        ttk.Label(cfg, text='计算引擎').grid(row=row, column=0, sticky='w')
+        self.engine_box = ttk.Combobox(cfg, textvariable=self.engine_var, values=['Python', 'Go'],
+                                       state='readonly', width=10)
+        self.engine_box.grid(row=row, column=1, sticky='w', pady=2)
+        self.engine_box.bind('<<ComboboxSelected>>', self.on_engine_changed)
+        row += 1
+        ttk.Label(cfg, text='Go 线程数').grid(row=row, column=0, sticky='w')
+        self.threads_spin = ttk.Spinbox(cfg, from_=1, to=64, increment=1, textvariable=self.threads_var,
+                                        width=8, command=self.on_setting_changed)
+        self.threads_spin.grid(row=row, column=1, sticky='w', pady=2)
+        self.threads_spin.bind('<FocusOut>', lambda _e: self.on_setting_changed())
+        row += 1
+        ttk.Label(cfg, text='长捉上限').grid(row=row, column=0, sticky='w')
+        chase_spin = ttk.Spinbox(cfg, from_=2, to=20, increment=1, textvariable=self.long_chase_var,
+                                 width=8, command=self.on_rule_setting_changed)
+        chase_spin.grid(row=row, column=1, sticky='w', pady=2)
+        chase_spin.bind('<FocusOut>', self.on_rule_setting_changed)
+        row += 1
+        ttk.Label(cfg, text='未吃子和棋步数').grid(row=row, column=0, sticky='w')
+        no_capture_spin = ttk.Spinbox(cfg, from_=1, to=100, increment=1, textvariable=self.no_capture_var,
+                                      width=8, command=self.on_rule_setting_changed)
+        no_capture_spin.grid(row=row, column=1, sticky='w', pady=2)
+        no_capture_spin.bind('<FocusOut>', self.on_rule_setting_changed)
         row += 1
         ttk.Label(cfg, text='思考时间(秒)').grid(row=row, column=0, sticky='w')
         spin = ttk.Spinbox(cfg, from_=0.3, to=30, increment=0.5, textvariable=self.budget_var, width=8,
@@ -258,8 +330,9 @@ class App:
                         command=lambda: (self.save_settings(), self.draw_board())).grid(
             row=row, column=0, columnspan=2, sticky='w')
         row += 1
-        ttk.Label(cfg, text='思考时间对 V15、V16（迭代加深）生效；\n人机对战中提示只针对玩家一方',
+        ttk.Label(cfg, text='思考时间对 V15、V16、V17（迭代加深）生效；\n人机对战中提示只针对玩家一方',
                   foreground='#888888').grid(row=row, column=0, columnspan=2, sticky='w')
+        self.update_engine_widgets()
 
         mult_box = ttk.LabelFrame(right, text='倍率', padding=8)
         mult_box.pack(fill='x', pady=(0, 8))
@@ -465,12 +538,19 @@ class App:
             budget_ms = self.think_budget_ms()
             search = dict(self.config['search'])
             v16_params = self.config['v16']
+            v17_params = self.config['v17']
+            engine = 'go' if self.engine_var.get() == 'Go' else 'python'
+            try:
+                threads = min(64, max(1, int(self.threads_var.get())))
+            except (tk.TclError, ValueError):
+                threads = 4
             snapshot = g.clone()
             self.ai_busy = purpose == 'move'
 
             def worker():
                 try:
-                    result = compute_hint(snapshot, model, budget_ms, search, v16_params)
+                    result = compute_hint(snapshot, model, budget_ms, search, v16_params, v17_params,
+                                          engine, threads)
                 except Exception as exc:  # noqa: BLE001 — AI 出错不应影响对局
                     result = {'error': f'{type(exc).__name__}: {exc}'}
                 self.ai_queue.put((token, purpose, result))
@@ -657,10 +737,18 @@ class App:
     def after_action(self):
         self.clear_selection()
         if self.game.phase == 'over':
-            self.move_log.append(f'—— {SIDE_NAMES[self.game.winner]}获胜 ——')
+            if self.game.winner == 'draw':
+                self.move_log.append(
+                    f'—— 和棋（连续 {self.game.no_capture_limit} 个普通移子未吃子）——')
+            else:
+                self.move_log.append(f'—— {SIDE_NAMES[self.game.winner]}获胜 ——')
         self.request_ai()
         self.refresh()
         if self.game.phase == 'over':
+            if self.game.winner == 'draw':
+                messagebox.showinfo(
+                    '对局结束', f'连续 {self.game.no_capture_limit} 个普通移子未吃子，和棋。')
+                return
             if self.is_vs():
                 result = '你赢了！' if self.game.winner == self.player_side else '电脑获胜。'
                 messagebox.showinfo('对局结束', f'{SIDE_NAMES[self.game.winner]}获胜，{result}')
@@ -689,7 +777,11 @@ class App:
 
     def new_game(self):
         self.ai_token += 1
-        self.game = Game()
+        rules = self.config.get('rules', {})
+        self.game = Game(
+            long_chase_limit=rules.get('long_chase_limit', DEFAULT_LONG_CHASE_LIMIT),
+            no_capture_limit=rules.get('no_capture_limit', DEFAULT_NO_CAPTURE_LIMIT),
+        )
         self.move_log = []
         self.min_history = 1
         if self.is_vs():
@@ -729,6 +821,9 @@ class App:
             return
         self.ai_token += 1
         self.game = game
+        self.long_chase_var.set(game.long_chase_limit)
+        self.no_capture_var.set(game.no_capture_limit)
+        self.save_settings()
         self.move_log = [f'导入局面：{path.replace(chr(92), "/").rsplit("/", 1)[-1]}']
         # 导入的局面没有更早的历史，悔棋不能越过它
         self.min_history = len(game.history)

@@ -4,10 +4,10 @@
 - 训练样本（每个局面一条）；
 - 外部来源（摄像头识别、其他棋盘程序）同步局面后让 AI 给提示。
 
-状态格式（v1）::
+状态格式（v5）::
 
     {
-      "v": 1,
+      "v": 5,
       "turn": "red",                       # 轮到谁走
       "hp": {"red": 48, "black": 55},      # 可省略；省略时由被吃棋子推算
       "board": [                           # 8 行 × 4 列，行 0 在上
@@ -20,17 +20,24 @@
       },
       "combo": {"red": 0, "black": 2},     # 当前连击（v2，可省略，默认 0）
       "max_combo": {"red": 1, "black": 2}, # 本局最高连击（v2，可省略，默认 0）
-      "flip_score": 24,                    # 双方手动翻子累计翻棋分（v2，可省略，默认 0）
+      "flip_score": 24,                    # 开局四枚明子的翻棋分（v4）
+      "no_capture_plies": 3,                # 连续未吃子的普通移子数；翻棋不计（v4）
+      "chase_count": {"red": 2, "black": 0}, # 当前连续追同一目标次数（v3）
+      "chase_target": {"red": 9, "black": null}, # 追踪目标的格索引（v3）
+      "rules": {"long_chase_limit": 5, "no_capture_limit": 16}, # 对局规则阈值（v5）
       "multiplier": {...}                  # 导出时附带的倍率明细，导入时忽略（按上面各项重新计算）
     }
 
-棋子类型统一用 将 仕 象 车 马 炮 兵；导入时也接受 帅 相 士 卒 等显示名。
+棋子类型统一用 将 仕 象 车 马 炮 兵；导入时也接受 帅 相 士 卒 等显示名。v1~v3 的未吃子计数和翻棋分口径不同，导入时重置为 0；其中存在的长捉计数会保留。v1~v4 未保存可调规则阈值，使用默认值。
 剩余棋子池（暗子的可能身份）= 全部棋子 − 明子 − 被吃棋子，不需要单独给出。
 """
 
-from .game import COLS, INITIAL_HP, PIECE_CONFIG, ROWS, Game, compute_multiplier, make_piece
+from .game import (
+    COLS, DEFAULT_LONG_CHASE_LIMIT, DEFAULT_NO_CAPTURE_LIMIT,
+    INITIAL_HP, PIECE_CONFIG, ROWS, Game, compute_multiplier, make_piece,
+)
 
-STATE_VERSION = 2
+STATE_VERSION = 5
 PIECE_TYPES = list(PIECE_CONFIG)  # 将 仕 象 车 马 炮 兵
 SIDES = ('red', 'black')
 SIDE_PREFIX = {'red': 'r', 'black': 'b'}
@@ -93,6 +100,14 @@ def game_to_state(game):
         'combo': dict(game.combo),
         'max_combo': dict(game.max_combo),
         'flip_score': game.flip_score,
+        'no_capture_plies': game.no_capture_plies,
+        'chase_count': dict(game.chase_count),
+        'chase_target': {side: (None if target is None else target[0] * COLS + target[1])
+                         for side, target in game.chase_target.items()},
+        'rules': {
+            'long_chase_limit': game.long_chase_limit,
+            'no_capture_limit': game.no_capture_limit,
+        },
         'multiplier': game.get_multiplier(),
     }
 
@@ -132,7 +147,17 @@ def game_from_state(state):
                 raise ValueError(f'captured.{side} 中无效的条目：{name}={n!r}')
             captured[side][t] += n
 
-    game = Game(shuffle_pool=False)
+    rules = state.get('rules') or {}
+    if not isinstance(rules, dict):
+        raise ValueError('rules 必须是对象')
+    long_chase_limit = rules.get('long_chase_limit', DEFAULT_LONG_CHASE_LIMIT)
+    no_capture_limit = rules.get('no_capture_limit', DEFAULT_NO_CAPTURE_LIMIT)
+    if not isinstance(long_chase_limit, int) or isinstance(long_chase_limit, bool) or not 2 <= long_chase_limit <= 20:
+        raise ValueError('rules.long_chase_limit 必须是 2 到 20 的整数')
+    if not isinstance(no_capture_limit, int) or isinstance(no_capture_limit, bool) or not 1 <= no_capture_limit <= 100:
+        raise ValueError('rules.no_capture_limit 必须是 1 到 100 的整数')
+    game = Game(shuffle_pool=False, long_chase_limit=long_chase_limit,
+                no_capture_limit=no_capture_limit)
     up = _empty_counts()
     hidden = empty = 0
     for r in range(ROWS):
@@ -175,12 +200,38 @@ def game_from_state(state):
     flip_score = state.get('flip_score', 0)
     if not isinstance(flip_score, int) or flip_score < 0:
         raise ValueError(f'flip_score 必须是非负整数，收到 {flip_score!r}')
+    if state.get('v', 1) < 4:
+        # v1~v3 累计的是对局中后续手动翻子分，无法从当前局面还原开局四子分数。
+        flip_score = 0
 
     game.remaining_pool = pool
     game.hp = hp
     game.combo = combo
     game.max_combo = max_combo
     game.flip_score = flip_score
+    no_capture_plies = state.get('no_capture_plies', 0)
+    if not isinstance(no_capture_plies, int) or no_capture_plies < 0:
+        raise ValueError(f'no_capture_plies 必须是非负整数，收到 {no_capture_plies!r}')
+    if state.get('v', 1) < 4:
+        # v3 把翻棋也计入未吃子步数，旧版本无法还原新的连续移子计数。
+        no_capture_plies = 0
+    game.no_capture_plies = no_capture_plies
+    game.chase_count = _side_ints(state, 'chase_count')
+    chase_targets = state.get('chase_target') or {}
+    game.chase_target = {}
+    for side in SIDES:
+        target = chase_targets.get(side)
+        if target is None:
+            game.chase_target[side] = None
+        elif isinstance(target, int) and 0 <= target < ROWS * COLS:
+            game.chase_target[side] = divmod(target, COLS)
+        else:
+            raise ValueError(f'chase_target.{side} 必须是棋盘坐标索引或 null')
+        position = game.chase_target[side]
+        if position is not None:
+            target_piece = game.board[position[0]][position[1]]
+            if not target_piece or not target_piece['face_up'] or target_piece['side'] == side:
+                raise ValueError(f'chase_target.{side} 必须指向对方明子')
     game.current_turn = turn
     game.setup_index = len(game.setup_positions)
     game.phase = 'playing'
@@ -189,6 +240,9 @@ def game_from_state(state):
     if hp['red'] <= 0 or hp['black'] <= 0:
         game.phase = 'over'
         game.winner = 'black' if hp['red'] <= 0 else 'red'
+    elif game.no_capture_plies >= game.no_capture_limit:
+        game.phase = 'over'
+        game.winner = 'draw'
     game._face_up_cache = {}
     game.history = []
     game.record_history()
@@ -210,14 +264,14 @@ def _side_ints(state, key):
 # 前 608 维与原项目 training/encode.py 完全相同（19 通道 × 32 格），之后追加：
 #   608-621：各方被吃棋子数 / 该类型总数（red 7 种 + black 7 种，顺序 将仕象车马炮兵）
 #   622-635：剩余池（暗子可能身份）各类型数量 / 该类型总数（同上顺序）
-#   636-642：倍率相关：当前连击 红/黑 ÷5、最高连击 红/黑 ÷5、翻棋分 ÷172、血量差 ÷60、倍率 ÷500
+#   636-642：倍率相关：当前连击 红/黑 ÷5、最高连击 红/黑 ÷5、开局四子翻棋分 ÷40、血量差 ÷60、倍率 ÷500
 # 原编码看不出暗子里还剩什么，追加的 28 维让模型知道“翻开大概率是什么”；
 # 倍率相关 7 维让模型能学到“领先时把倍率做大、落后时压小”。
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 NUM_CHANNELS = 19
 BOARD_SIZE = ROWS * COLS
 BASE_SIZE = NUM_CHANNELS * BOARD_SIZE  # 608
-MAX_FLIP_SCORE = 172  # 全部 32 子都被手动翻开时的翻棋分（实际最多 28 子，留有余量）
+MAX_FLIP_SCORE = 40  # 开局四子最高分：双将 + 双仕
 FEATURE_SIZE = BASE_SIZE + 2 * 2 * len(PIECE_TYPES) + 7  # 643
 
 

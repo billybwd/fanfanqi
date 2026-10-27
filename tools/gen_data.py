@@ -4,7 +4,7 @@
 训练时用 fanfanqi.state.encode_features(game_from_state(...)) 转成 636 维特征。
 
 用法：
-    python -m tools.gen_data --games 50 --model StrategicV15AI --think 0.3 --out data/selfplay.jsonl
+    python -m tools.gen_data --games 50 --model StrategicV17AI --think 0.3 --out data/selfplay.jsonl
 """
 
 import argparse
@@ -47,7 +47,7 @@ def play_and_record(model, budget_ms, epsilon, max_plies=300):
     for i, s in enumerate(samples):
         side = s['state']['turn']
         # result：从“轮到走的一方”看的最终结果，赢 1 / 输 -1 / 和 0
-        s['result'] = 0 if winner is None else (1 if winner == side else -1)
+        s['result'] = 0 if winner in (None, 'draw') else (1 if winner == side else -1)
         # reward：训练的最终评分 = 胜负 × 终局倍率（同样从轮到走的一方看）
         s['reward'] = s['result'] * final_multiplier
         s['final_multiplier'] = final_multiplier
@@ -62,8 +62,8 @@ def play_and_record(model, budget_ms, epsilon, max_plies=300):
 def main():
     parser = argparse.ArgumentParser(description='自对弈生成训练样本（JSONL）')
     parser.add_argument('--games', type=int, default=20)
-    parser.add_argument('--model', default='StrategicV16AI')
-    parser.add_argument('--think', type=float, default=0.3, help='每步思考秒数（V15/V16）')
+    parser.add_argument('--model', default='StrategicV17AI')
+    parser.add_argument('--think', type=float, default=0.3, help='每步思考秒数（V15/V16/V17）')
     parser.add_argument('--epsilon', type=float, default=0.05, help='随机着法比例')
     parser.add_argument('--out', default=os.path.join('data', 'selfplay.jsonl'))
     parser.add_argument('--seed', type=int, default=None)

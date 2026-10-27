@@ -7,18 +7,26 @@
 import copy
 import json
 import os
+from typing import Any, Dict
 
 from .v16 import DEFAULT_PARAMS as V16_DEFAULT_PARAMS
+from .v17 import DEFAULT_PARAMS as V17_DEFAULT_PARAMS
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.json')
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, Any] = {
     # 'record'：录入实物对局，AI 只给提示；'vs'：人机对战，翻子随机
     'mode': 'record',
     # 人机对战中玩家执哪一方（红方先手）
     'player_side': 'red',
-    'ai_model': 'StrategicV16AI',
-    # 每步思考时间（秒），只对 StrategicV15AI 生效
+    'ai_model': 'StrategicV17AI',
+    'engine': 'python',
+    'go_threads': 4,
+    'rules': {
+        'long_chase_limit': 5,
+        'no_capture_limit': 16,
+    },
+    # 每步思考时间（秒），对 V15、V16、V17 生效
     'think_time_sec': 2.5,
     # 提示方：'both' | 'red' | 'black' | 'off'。人机对战中只会提示玩家一方
     'hint_side': 'both',
@@ -37,10 +45,11 @@ DEFAULT_CONFIG = {
     },
     # StrategicV16AI 参数（目标函数、搜索宽度、评估权重）；含义见 fanfanqi/v16.py
     'v16': copy.deepcopy(V16_DEFAULT_PARAMS),
+    'v17': copy.deepcopy(V17_DEFAULT_PARAMS),
 }
 
 
-def _merge(defaults, loaded):
+def _merge(defaults: Dict[str, Any], loaded: Any) -> Dict[str, Any]:
     result = copy.deepcopy(defaults)
     if not isinstance(loaded, dict):
         return result
@@ -61,7 +70,7 @@ def _merge(defaults, loaded):
     return result
 
 
-def load_config(path=CONFIG_PATH):
+def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
     try:
         with open(path, encoding='utf-8') as f:
             loaded = json.load(f)
@@ -74,7 +83,7 @@ def load_config(path=CONFIG_PATH):
     return _merge(DEFAULT_CONFIG, loaded)
 
 
-def save_config(config, path=CONFIG_PATH):
+def save_config(config: Dict[str, Any], path: str = CONFIG_PATH) -> None:
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=2)

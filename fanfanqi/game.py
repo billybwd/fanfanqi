@@ -34,10 +34,12 @@ SIDE_NAMES = {'red': '红方', 'black': '黑方'}
 DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
 INITIAL_HP = 60
+DEFAULT_LONG_CHASE_LIMIT = 5
+DEFAULT_NO_CAPTURE_LIMIT = 16
 
 # 倍率规则：倍率 = 连击系数 × (翻棋分 + 血量差)
-# 翻棋分：每次手动翻子按翻出棋子类型累加（双方合计；炮打暗子、开局放置不算）
-FLIP_SCORE = {'兵': 2, '车': 4, '马': 4, '炮': 6, '象': 8, '仕': 8, '将': 12}
+# 翻棋分：只累计开局放置的 4 枚明子；之后翻子和炮打暗子不计分
+FLIP_SCORE = {'兵': 2, '车': 4, '马': 4, '炮': 6, '象': 4, '仕': 8, '将': 12}
 # 连击：同一方连续自己的回合都吃到子（含炮打暗子）；某回合没吃子则清零。
 # 双方最高连击都不超过该值时连击系数为 1；一方超过取该方最高连击；双方都超过取两者之和
 COMBO_THRESHOLD = 3
@@ -49,9 +51,9 @@ def combo_factor(max_combo_red, max_combo_black):
 
 
 def compute_multiplier(hp, max_combo, flip_score):
-    """返回倍率及各组成部分。血量差按 0 封底后取绝对值（被扣到负数的一方按 0 计）。"""
+    """返回倍率及各组成部分；血量差使用双方原始 HP，允许失败方为负数。"""
     factor = combo_factor(max_combo['red'], max_combo['black'])
-    hp_diff = abs(max(0, hp['red']) - max(0, hp['black']))
+    hp_diff = abs(hp['red'] - hp['black'])
     return {
         'combo_factor': factor,
         'flip_score': flip_score,
@@ -90,7 +92,10 @@ def _clone_cell(cell):
 
 
 class Game:
-    def __init__(self, shuffle_pool=True):
+    def __init__(self, shuffle_pool=True, long_chase_limit=DEFAULT_LONG_CHASE_LIMIT,
+                 no_capture_limit=DEFAULT_NO_CAPTURE_LIMIT):
+        self.long_chase_limit = min(20, max(2, int(long_chase_limit)))
+        self.no_capture_limit = min(100, max(1, int(no_capture_limit)))
         self.board = []
         self.current_turn = 'red'
         self.hp = {'red': INITIAL_HP, 'black': INITIAL_HP}
@@ -108,6 +113,9 @@ class Game:
         self.combo = {'red': 0, 'black': 0}       # 当前连击
         self.max_combo = {'red': 0, 'black': 0}   # 本局最高连击
         self.flip_score = 0
+        self.no_capture_plies = 0
+        self.chase_count = {'red': 0, 'black': 0}
+        self.chase_target = {'red': None, 'black': None}
         self.history = []
         self.init_board(shuffle_pool)
         self.record_history()
@@ -135,6 +143,9 @@ class Game:
             'combo': dict(self.combo),
             'max_combo': dict(self.max_combo),
             'flip_score': self.flip_score,
+            'no_capture_plies': self.no_capture_plies,
+            'chase_count': dict(self.chase_count),
+            'chase_target': dict(self.chase_target),
         }
 
     def restore_snapshot(self, snapshot):
@@ -150,6 +161,9 @@ class Game:
         self.combo = dict(snapshot['combo'])
         self.max_combo = dict(snapshot['max_combo'])
         self.flip_score = snapshot['flip_score']
+        self.no_capture_plies = snapshot.get('no_capture_plies', 0)
+        self.chase_count = dict(snapshot.get('chase_count', {'red': 0, 'black': 0}))
+        self.chase_target = dict(snapshot.get('chase_target', {'red': None, 'black': None}))
         self._face_up_cache = {}
 
     def get_multiplier(self):
@@ -168,12 +182,24 @@ class Game:
         copy = Game.__new__(Game)
         copy.setup_positions = self.setup_positions
         copy.restore_snapshot(self.create_snapshot())
+        copy.long_chase_limit = self.long_chase_limit
+        copy.no_capture_limit = self.no_capture_limit
         # 历史快照创建后不会被原地修改，复制列表即可
         copy.history = list(self.history)
         return copy
 
     def record_history(self):
         self.history.append(self.create_snapshot())
+
+    def configure_rules(self, long_chase_limit=None, no_capture_limit=None):
+        if long_chase_limit is not None:
+            self.long_chase_limit = min(20, max(2, int(long_chase_limit)))
+        if no_capture_limit is not None:
+            self.no_capture_limit = min(100, max(1, int(no_capture_limit)))
+        if self.phase == 'playing' and self.no_capture_plies >= self.no_capture_limit:
+            self.phase = 'over'
+            self.winner = 'draw'
+            self.record_history()
 
     def can_undo(self):
         return len(self.history) > 1
@@ -199,6 +225,7 @@ class Game:
         piece = self.remaining_pool.pop(pool_index)
         piece['face_up'] = True
         self.board[pos['row']][pos['col']] = piece
+        self.flip_score += FLIP_SCORE[piece['type']]
         self._face_up_cache = {}
         self.setup_index += 1
         if self.setup_index >= len(self.setup_positions):
@@ -284,7 +311,80 @@ class Game:
                     moves.append({'row': nr, 'col': nc, 'type': 'move'})
                 elif self.can_eat(piece, target):
                     moves.append({'row': nr, 'col': nc, 'type': 'capture'})
-        return moves
+        if not moves:
+            return moves
+        return [m for m in moves if not self._would_violate_chase(
+            row, col, m['row'], m['col'], piece['side'])]
+
+    def _capture_targets_from(self, row, col, side):
+        """列出该明子当前能直接吃到的敌方明子坐标（暗子不算长捉目标）。"""
+        piece = self.board[row][col]
+        if not piece or not piece['face_up'] or piece['side'] != side:
+            return []
+        targets = []
+        if piece['type'] == '炮':
+            for dr, dc in DIRS:
+                r, c = row + dr, col + dc
+                mounted = False
+                while 0 <= r < ROWS and 0 <= c < COLS:
+                    target = self.board[r][c]
+                    if target:
+                        if not mounted:
+                            mounted = True
+                        else:
+                            if target['face_up'] and target['side'] != side:
+                                targets.append((r, c))
+                            break
+                    r += dr
+                    c += dc
+        else:
+            for dr, dc in DIRS:
+                r, c = row + dr, col + dc
+                if not (0 <= r < ROWS and 0 <= c < COLS):
+                    continue
+                target = self.board[r][c]
+                if target and self.can_eat(piece, target):
+                    targets.append((r, c))
+        return targets
+
+    def _would_violate_chase(self, fr, fc, tr, tc, side):
+        """第 5 次连续威胁同一目标的走法必须改追其他目标或变招。"""
+        if self.board[tr][tc] is not None:
+            return False
+        piece = self.board[fr][fc]
+        self.board[fr][fc], self.board[tr][tc] = None, piece
+        try:
+            old_target = self.chase_target[side]
+            return (old_target in self._capture_targets_from(tr, tc, side)
+                    and self.chase_count[side] >= self.long_chase_limit - 1)
+        finally:
+            self.board[fr][fc], self.board[tr][tc] = piece, None
+
+    def _advance_chase(self, side, fr, fc, tr, tc, captured, captured_visible):
+        opponent = other_side(side)
+        old_target = self.chase_target[side]
+        # 吃掉被追踪目标会终止该追逐；吃子也结束己方长捉计数。
+        if captured_visible:
+            for tracked_side in ('red', 'black'):
+                if self.chase_target[tracked_side] == (tr, tc):
+                    self.chase_target[tracked_side] = None
+                    self.chase_count[tracked_side] = 0
+        # 若本方棋子正被对方追踪，跟随它的新位置。
+        if self.chase_target[opponent] == (fr, fc):
+            self.chase_target[opponent] = (tr, tc)
+        if captured:
+            self.chase_target[side] = None
+            self.chase_count[side] = 0
+            return
+        targets = self._capture_targets_from(tr, tc, side)
+        if old_target in targets:
+            self.chase_count[side] += 1
+        elif targets:
+            self.chase_target[side] = targets[0]
+            self.chase_count[side] = 1
+        else:
+            self.chase_target[side] = None
+            self.chase_count[side] = 0
 
     # 翻棋（从池中选择要翻出的棋子）
     def flip_piece(self, row, col, pool_index):
@@ -298,13 +398,17 @@ class Game:
         chosen['face_up'] = True
         self.board[row][col] = chosen
         self._face_up_cache = {}
-        self.flip_score += FLIP_SCORE[chosen['type']]
+        self.chase_count[self.current_turn] = 0
+        self.chase_target[self.current_turn] = None
         self._record_turn_combo(self.current_turn, False)
         self.last_action = {
             'type': 'flip', 'row': row, 'col': col,
             'piece': {'type': chosen['type'], 'side': chosen['side'], 'hp': chosen['hp']},
         }
         self.switch_turn()
+        if self.no_capture_plies >= self.no_capture_limit:
+            self.phase = 'over'
+            self.winner = 'draw'
         self.record_history()
         return True
 
@@ -321,6 +425,9 @@ class Game:
             return False
 
         target = self.board[to_row][to_col]
+        mover_side = piece['side']
+        captured = target is not None
+        captured_visible = bool(target and target['face_up'])
         if target:
             # 吃子
             if not target['face_up']:
@@ -349,6 +456,8 @@ class Game:
         self.board[to_row][to_col] = piece
         self.board[from_row][from_col] = None
         self._face_up_cache = {}
+        self.no_capture_plies = 0 if captured else self.no_capture_plies + 1
+        self._advance_chase(mover_side, from_row, from_col, to_row, to_col, captured, captured_visible)
         self._record_turn_combo(piece['side'], target is not None)
 
         # 判断胜负
@@ -360,6 +469,9 @@ class Game:
             self.winner = 'red'
         else:
             self.switch_turn()
+            if self.no_capture_plies >= self.no_capture_limit:
+                self.phase = 'over'
+                self.winner = 'draw'
 
         self.record_history()
         return True
@@ -406,6 +518,9 @@ class Game:
             'hp': dict(self.hp),
             'phase': self.phase,
             'winner': self.winner,
+            'no_capture_plies': self.no_capture_plies,
+            'chase_count': dict(self.chase_count),
+            'chase_target': dict(self.chase_target),
             'remaining_pool': [
                 {'type': p['type'], 'side': p['side'], 'rank': p['rank'], 'hp': p['hp']}
                 for p in self.remaining_pool],

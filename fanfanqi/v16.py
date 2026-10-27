@@ -23,8 +23,6 @@ DEFAULT_PARAMS = {
     'multiplier_exponent': 1.0,
     # κ：价值为负（预计输）时乘的系数。1 = 风险中性；>1 = 更看重少输
     'loss_aversion': 1.0,
-    # 估算终局倍率时，剩余暗子的翻棋分按多大比例计入（假设其中多少会被手动翻开）
-    'future_flip_factor': 0.5,
     # 评估分（HP 单位）换算胜率的温度：胜率 = sigmoid(评估分 / 温度)
     'win_temperature': 12.0,
     'max_depth': 8,
@@ -40,7 +38,7 @@ DEFAULT_PARAMS = {
     'weights': {
         'hp': 1.0,                 # 双方剩余 HP 之差
         'piece_value': {           # 明子的额外价值（战斗力，HP 已单独计）
-            '将': 10, '仕': 6, '象': 3, '车': 2.5, '马': 2, '炮': 3, '兵': 1.5,
+            '将': 10, '仕': 6, '象': 3, '车': 2.5, '马': 2, '炮': 5, '兵': 1.5,
         },
         'mobility': 0.3,           # 每个可走的相邻空格
         'hanging': 0.6,            # 轮到自己走时被威胁的棋子（最大的那个除外）×(HP+子力)
@@ -121,7 +119,9 @@ class _Timeout(Exception):
 class Position:
     """搜索用的紧凑局面：32 格整数棋盘 + 剩余池计数 + 血量 / 连击 / 翻棋分。"""
 
-    __slots__ = ('b', 'pool', 'hp', 'turn', 'cur', 'mx', 'flip', 'winner')
+    __slots__ = ('b', 'pool', 'hp', 'turn', 'cur', 'mx', 'flip', 'winner',
+                 'no_capture_plies', 'chase_count', 'chase_target',
+                 'long_chase_limit', 'no_capture_limit')
 
     @classmethod
     def from_game(cls, game):
@@ -142,11 +142,21 @@ class Position:
         pos.mx = [game.max_combo['red'], game.max_combo['black']]
         pos.flip = game.flip_score
         pos.winner = -1 if game.winner is None else SIDE_KEYS.index(game.winner)
+        pos.no_capture_plies = game.no_capture_plies
+        pos.long_chase_limit = game.long_chase_limit
+        pos.no_capture_limit = game.no_capture_limit
+        pos.chase_count = [game.chase_count['red'], game.chase_count['black']]
+        pos.chase_target = [
+            -1 if game.chase_target['red'] is None else game.chase_target['red'][0] * COLS + game.chase_target['red'][1],
+            -1 if game.chase_target['black'] is None else game.chase_target['black'][0] * COLS + game.chase_target['black'][1],
+        ]
         return pos
 
     def key(self):
         return (tuple(self.b), tuple(self.pool), self.hp[0], self.hp[1], self.turn,
-                self.cur[0], self.cur[1], self.mx[0], self.mx[1], self.flip)
+                self.cur[0], self.cur[1], self.mx[0], self.mx[1], self.flip,
+                self.no_capture_plies, tuple(self.chase_count), tuple(self.chase_target),
+                self.long_chase_limit, self.no_capture_limit)
 
     # ---------------------------------------------------------- 倍率
     def combo_factor(self):
@@ -154,22 +164,19 @@ class Position:
         return sum(over) if over else 1
 
     def hp_diff(self):
-        return abs(max(0, self.hp[0]) - max(0, self.hp[1]))
+        return abs(self.hp[0] - self.hp[1])
 
     def multiplier(self):
         return self.combo_factor() * (self.flip + self.hp_diff())
 
-    def pool_flip_sum(self):
-        pool = self.pool
-        return sum(pool[c] * FLIPC[c] for c in CODES if pool[c])
-
     # ------------------------------------------------------ 走子 / 撤销
     def _save(self, a, c, pool_code):
         return (a, self.b[a], c, self.b[c], self.hp[0], self.hp[1], self.turn,
-                self.cur[0], self.cur[1], self.mx[0], self.mx[1], self.flip, self.winner, pool_code)
+                self.cur[0], self.cur[1], self.mx[0], self.mx[1], self.flip, self.winner,
+                self.no_capture_plies, tuple(self.chase_count), tuple(self.chase_target), pool_code)
 
     def undo(self, u):
-        a, pa, c, pc, h0, h1, t, c0, c1, m0, m1, f, w, pool_code = u
+        a, pa, c, pc, h0, h1, t, c0, c1, m0, m1, f, w, quiet, chase_count, chase_target, pool_code = u
         self.b[a] = pa
         self.b[c] = pc
         self.hp[0], self.hp[1] = h0, h1
@@ -178,6 +185,9 @@ class Position:
         self.mx[0], self.mx[1] = m0, m1
         self.flip = f
         self.winner = w
+        self.no_capture_plies = quiet
+        self.chase_count = list(chase_count)
+        self.chase_target = list(chase_target)
         if pool_code:
             self.pool[pool_code] += 1
 
@@ -207,22 +217,69 @@ class Position:
             self._check_over()
         else:
             self.cur[me] = 0
+        self.no_capture_plies = 0 if q else self.no_capture_plies + 1
+        opponent = me ^ 1
+        if q:
+            for side in (0, 1):
+                if self.chase_target[side] == c:
+                    self.chase_target[side] = -1
+                    self.chase_count[side] = 0
+        if self.chase_target[opponent] == a:
+            self.chase_target[opponent] = c
+        if q:
+            self.chase_target[me] = -1
+            self.chase_count[me] = 0
+        else:
+            targets = self.capture_targets_from(c, me)
+            old_target = self.chase_target[me]
+            if old_target in targets:
+                self.chase_count[me] += 1
+            elif targets:
+                self.chase_target[me] = targets[0]
+                self.chase_count[me] = 1
+            else:
+                self.chase_target[me] = -1
+                self.chase_count[me] = 0
         self.turn = me ^ 1
         return u
+
+    def capture_targets_from(self, sq, side):
+        p = self.b[sq]
+        if not p or SIDE[p] != side:
+            return []
+        if TYPE[p] == CANNON:
+            targets = []
+            for ray in RAYS[sq]:
+                mounted = False
+                for s2 in ray:
+                    q = self.b[s2]
+                    if not q:
+                        continue
+                    if not mounted:
+                        mounted = True
+                    else:
+                        if q != HIDDEN and SIDE[q] != side:
+                            targets.append(s2)
+                        break
+            return targets
+        return [n for n in NEIGH[sq] if self.b[n] and self.b[n] != HIDDEN and
+                SIDE[self.b[n]] != side and EAT[p][self.b[n]]]
 
     def do_flip(self, sq, code):
         u = self._save(sq, sq, code)
         self.b[sq] = code
         self.pool[code] -= 1
-        self.flip += FLIPC[code]
+        self.chase_count[self.turn] = 0
+        self.chase_target[self.turn] = -1
         self.cur[self.turn] = 0
         self.turn ^= 1
         return u
 
-    def do_flip_approx(self, sq, expected_flip):
-        """深层翻子的近似：格子仍是暗子，只换手、清连击、翻棋分加上期望值。"""
+    def do_flip_approx(self, sq):
+        """深层翻子的近似：格子仍是暗子，只换手并清连击。"""
         u = self._save(sq, sq, 0)
-        self.flip += expected_flip
+        self.chase_count[self.turn] = 0
+        self.chase_target[self.turn] = -1
         self.cur[self.turn] = 0
         self.turn ^= 1
         return u
@@ -237,6 +294,12 @@ class Position:
         self.b[a] = EMPTY
         self._hit(me)
         self._check_over()
+        self.no_capture_plies = 0
+        opponent = me ^ 1
+        if self.chase_target[opponent] == a:
+            self.chase_target[opponent] = c
+        self.chase_target[me] = -1
+        self.chase_count[me] = 0
         self.turn = me ^ 1
         return u
 
@@ -277,7 +340,14 @@ class Position:
                         moves.append((sq, s2))
                     elif q != HIDDEN and eat[q]:
                         caps.append((sq, s2))
-        return caps, hidden_caps, moves, flips
+        legal_moves = []
+        for a, c in moves:
+            u = self.do_move(a, c)
+            violates = self.chase_count[me] >= self.long_chase_limit - 1
+            self.undo(u)
+            if not violates:
+                legal_moves.append((a, c))
+        return caps, hidden_caps, legal_moves, flips
 
     def captures(self):
         b = self.b
@@ -423,7 +493,7 @@ class Searcher:
         return score + w['tempo']
 
     def est_multiplier(self, pos):
-        m = pos.combo_factor() * (pos.flip + self.p['future_flip_factor'] * pos.pool_flip_sum() + pos.hp_diff())
+        m = pos.combo_factor() * (pos.flip + pos.hp_diff())
         return max(1.0, m)
 
     def _objective(self, v, multiplier):
@@ -552,7 +622,7 @@ class Searcher:
                 pos.undo(u)
         total = sum(pos.pool)
         if kind == FLIP and ply >= self.p['full_chance_plies']:
-            u = pos.do_flip_approx(a, pos.pool_flip_sum() / total)
+            u = pos.do_flip_approx(a)
             try:
                 return -self.negamax(pos, depth - 1, -beta, -alpha, ply + 1)
             finally:
@@ -572,6 +642,8 @@ class Searcher:
 
     def negamax(self, pos, depth, alpha, beta, ply):
         self._tick()
+        if pos.no_capture_plies >= pos.no_capture_limit:
+            return 0.0
         if pos.winner >= 0:
             return self.terminal_value(pos, ply)
         if depth <= 0:
@@ -610,6 +682,8 @@ class Searcher:
 
     def qsearch(self, pos, alpha, beta, ply, qdepth):
         self._tick()
+        if pos.no_capture_plies >= pos.no_capture_limit:
+            return 0.0
         if pos.winner >= 0:
             return self.terminal_value(pos, ply)
         stand = self.leaf_value(pos)
