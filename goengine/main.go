@@ -459,7 +459,7 @@ func makeSearcher(params map[string]any,strategy int,deadline time.Time,tt *Tran
 	wm:=weightMap(p); nested:=map[string]any{}; if raw,ok:=wm["piece_value"].(map[string]any);ok{nested=raw}
 	w:=Weights{HP:1,Mobility:0.3,Hanging:0.6,HangingOne:0.15,Pool:0.3,KingSoldierAdj:8,KingSoldierNear:3,KingCannon:5,KingTrapped:2,Tempo:0.5}
 	if wm!=nil {w.HP=number(wm["hp"],w.HP);w.Mobility=number(wm["mobility"],w.Mobility);w.Hanging=number(wm["hanging"],w.Hanging);w.HangingOne=number(wm["hanging_one"],w.HangingOne);w.Pool=number(wm["pool"],w.Pool);w.KingSoldierAdj=number(wm["king_soldier_adj"],w.KingSoldierAdj);w.KingSoldierNear=number(wm["king_soldier_near"],w.KingSoldierNear);w.KingCannon=number(wm["king_cannon"],w.KingCannon);w.KingTrapped=number(wm["king_trapped"],w.KingTrapped);w.Tempo=number(wm["tempo"],w.Tempo)}
-	pv:= [7]float64{10,6,3,2.5,2,5,1.5}; for i,t:=range pieceTypes {pv[i]=number(nested[t],pv[i])}
+	pv:= [7]float64{10,6,3,2.5,2,3,1.5}; for i,t:=range pieceTypes {pv[i]=number(nested[t],pv[i])}
 	interval:=intParam(p,"time_check_interval",32); if strategy==16 {interval=256}; if interval<1{interval=1}
 	cacheSize,delta,cannonEndgame:=0,-1.0,-1.0; if strategy==17 {cacheSize=intParam(p,"eval_cache_size",200000);delta=floatParam(p,"delta_margin",6);cannonEndgame=floatParam(p,"cannon_endgame_value",2)}; if cacheSize<0{cacheSize=0}
 	if tt==nil {tt=newTransTable(intParam(p,"tt_bits",21))}; if stop==nil {stop=&atomic.Bool{}}

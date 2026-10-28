@@ -120,6 +120,9 @@ def main():
     parser.add_argument('--val', type=float, default=0.2, help='验证集对局比例')
     parser.add_argument('--fix', default='tempo', help='保持不变的权重，逗号分隔（如 tempo,hp）')
     parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--temperature', type=float,
+                        help='拟合用的 win_temperature（默认取配置值）；配合 --fix hp 可以以 HP 为单位拟合其余权重，'
+                             '--apply 时一并写回')
     parser.add_argument('--out', help='把新配置段写到这个 JSON 文件')
     parser.add_argument('--apply', action='store_true', help='写回 config.json（验证集损失变差时拒绝）')
     args = parser.parse_args()
@@ -130,7 +133,7 @@ def main():
     config = load_config()
     key = 'v16' if args.model == 'StrategicV16AI' else 'v17'
     searcher = make_searcher(args.model, config)
-    temperature = searcher.p['win_temperature']
+    temperature = args.temperature or searcher.p['win_temperature']
     names, x, y, games = load_positions(paths, searcher)
     if len(y) < 1000:
         print(f'警告：只有 {len(y)} 个安静局面，拟合结果可能不稳定（建议 2 万以上）')
@@ -160,6 +163,7 @@ def main():
         print(f'{name:<24}{old:>10.3f}{new:>10.3f}{mark}')
 
     section = to_config(names, w, config[key])
+    section['win_temperature'] = temperature
     if args.out:
         with open(args.out, 'w', encoding='utf-8') as f:
             json.dump(section, f, ensure_ascii=False, indent=2)
