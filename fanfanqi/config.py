@@ -26,8 +26,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         'long_chase_limit': 5,
         'no_capture_limit': 16,
     },
-    # 每步思考时间（秒），对 V15、V16、V17 生效
+    # 提示的思考时间（秒），对 V15、V16、V17 生效
     'think_time_sec': 2.5,
+    # 人机对战中电脑走子的思考时间（秒）
+    'ai_think_time_sec': 2.5,
+    # 提示搜到这一层就先显示，之后每加深一层更新，直到思考时间用完；0 = 只显示最终结果
+    'hint_min_depth': 4,
     # 提示方：'both' | 'red' | 'black' | 'off'。人机对战中只会提示玩家一方
     'hint_side': 'both',
     'show_hint_on_board': True,

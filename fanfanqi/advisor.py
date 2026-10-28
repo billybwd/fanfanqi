@@ -93,26 +93,39 @@ def describe_last_action(last_action):
 
 
 def compute_hint(game, model_name=DEFAULT_MODEL, time_budget_ms=DEFAULT_TIME_BUDGET_MS, search_params=None,
-                 v16_params=None, v17_params=None, engine='python', threads=1):
+                 v16_params=None, v17_params=None, engine='python', threads=1, on_progress=None,
+                 min_depth=0, should_stop=None):
     """为当前行动方计算一条提示。
 
     在对局的副本上搜索，原对局不受影响（可在后台线程调用）。
     返回 dict：action / text / side / model / elapsed_ms / info。
+    on_progress(hint)：迭代加深的模型（V16 / V17，含 Go 引擎）每完成一层且深度 ≥ min_depth 时，
+    用同样格式（info['partial'] 为 True）回调当前最佳着法，便于提前显示、之后随深度更新；
+    min_depth 为 0 时不回调。should_stop()：返回 True 时提前结束计算（如局面已变化）。
     """
     side = game.current_turn
     work = game.clone()
     player = create_ai(model_name, side, time_budget_ms, search_params, v16_params, v17_params,
                        engine, threads)
     start = time.perf_counter()
+
+    def make_hint(action, info):
+        return {
+            'action': action,
+            'text': describe_action(game, action),
+            'side': side,
+            'side_name': SIDE_NAMES[side],
+            'model': model_name,
+            'elapsed_ms': (time.perf_counter() - start) * 1000,
+            'info': info,
+        }
+
+    if hasattr(player, 'on_progress'):
+        player.should_stop = should_stop
+        if on_progress is not None and min_depth > 0:
+            def progress(action, info):
+                if action and info.get('depth', 0) >= min_depth:
+                    on_progress(make_hint(action, info))
+            player.on_progress = progress
     action = player.get_move(work)
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    info = getattr(player, 'last_decision_info', None)
-    return {
-        'action': action,
-        'text': describe_action(game, action),
-        'side': side,
-        'side_name': SIDE_NAMES[side],
-        'model': model_name,
-        'elapsed_ms': elapsed_ms,
-        'info': info,
-    }
+    return make_hint(action, getattr(player, 'last_decision_info', None))

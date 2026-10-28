@@ -1,25 +1,28 @@
 """StrategicV17AI: V16 with broader tactical coverage and stricter time control."""
 
 import copy
-import random
+import math
+import struct
 import time
 
 from .v16 import (
+    CANNON,
     CANNON_HIDDEN,
+    EMPTY,
     CAPTURE,
     DEFAULT_PARAMS as V16_DEFAULT_PARAMS,
     FLIP,
     HPC,
     KING,
     MOVE,
-    Position,
+    NSQ,
     Searcher as V16Searcher,
     SOLDIER,
     T_RANK,
     TYPE,
     _Timeout,
     merge_params,
-    move_to_action,
+    run_search,
 )
 
 
@@ -28,7 +31,18 @@ DEFAULT_PARAMS.update({
     # Maximum hidden-cannon captures considered at each quiescence node.
     'q_hidden_caps': 1,
     # Number of consecutive hidden-cannon captures explored in quiescence.
-    'q_hidden_depth': 1,
+    # 0 keeps quiescence to visible captures only (hidden captures are still
+    # searched exactly by the main search); expanding them here cost too much depth.
+    'q_hidden_depth': 0,
+    # Delta pruning in quiescence: skip a capture when even the captured HP plus
+    # piece value plus this margin (HP units) cannot raise alpha. Negative disables.
+    'delta_margin': 6.0,
+    # Static evaluation cache entries kept per search; 0 disables.
+    'eval_cache_size': 200000,
+    # Cannon value depends on how crowded the board is (more screens, more
+    # targets): weights.piece_value['炮'] with all 32 squares occupied, this
+    # value with an empty board, linear in between. Negative keeps it fixed.
+    'cannon_endgame_value': 2.0,
     # Check the clock more often than V16 during recursive search.
     'time_check_interval': 32,
     # Progressive widening while many hidden pieces remain.
@@ -44,16 +58,83 @@ DEFAULT_PARAMS.update({
 })
 
 
+_MASK64 = (1 << 64) - 1
+
+
+def _sample_offset(pos):
+    """Systematic-sampling offset in [0, 1) for a position.
+
+    FNV-1a over board, pool and flip score, then splitmix64. The Go engine
+    computes the same value, so both engines sample identical outcomes.
+    """
+    h = 0xCBF29CE484222325
+    for byte in (*pos.b, *pos.pool, *struct.pack('<d', float(pos.flip))):
+        h = ((h ^ byte) * 0x100000001B3) & _MASK64
+    z = (h + 0x9E3779B97F4A7C15) & _MASK64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+    z ^= z >> 31
+    return (z >> 11) / float(1 << 53)
+
+
 class Searcher(V16Searcher):
     """V16 search with better flip ordering, hidden-capture quiescence and timing."""
 
     def __init__(self, params):
         super().__init__(params)
         self.time_check_interval = max(1, int(params.get('time_check_interval', 32)))
+        self.delta_margin = float(params.get('delta_margin', 6.0))
+        self.eval_cache_size = max(0, int(params.get('eval_cache_size', 200000)))
+        self.eval_cache = {}
+        self.cannon_full = self.pv[CANNON]
+        self.cannon_endgame = float(params.get('cannon_endgame_value', 2.0))
+
+    def _set_cannon_value(self, pos):
+        if self.cannon_endgame >= 0:
+            occupied = NSQ - pos.b.count(EMPTY)
+            self.pv[CANNON] = self.cannon_endgame + (self.cannon_full - self.cannon_endgame) * occupied / NSQ
+
+    def static_eval(self, pos):
+        # The evaluation only depends on board, pool, HP and side to move.
+        if not self.eval_cache_size:
+            self._set_cannon_value(pos)
+            return super().static_eval(pos)
+        key = (tuple(pos.b), tuple(pos.pool), pos.hp[0], pos.hp[1], pos.turn)
+        score = self.eval_cache.get(key)
+        if score is None:
+            if len(self.eval_cache) >= self.eval_cache_size:
+                self.eval_cache.clear()
+            self._set_cannon_value(pos)
+            score = self.eval_cache[key] = super().static_eval(pos)
+        return score
+
+    def eval_terms(self, pos):
+        # The dynamic cannon value is linear in its two endpoints, so split the
+        # cannon count into a full-board term and an endgame term.
+        self._set_cannon_value(pos)
+        terms = super().eval_terms(pos)
+        if self.cannon_endgame >= 0:
+            fullness = (NSQ - pos.b.count(EMPTY)) / NSQ
+            diff = terms['piece_value.炮']
+            terms['piece_value.炮'] = diff * fullness
+            terms['cannon_endgame_value'] = diff * (1 - fullness)
+        return terms
+
+    def term_weights(self):
+        weights = super().term_weights()
+        weights['piece_value.炮'] = self.cannon_full
+        if self.cannon_endgame >= 0:
+            weights['cannon_endgame_value'] = self.cannon_endgame
+        return weights
+
+    def _value_from_eval(self, pos, score):
+        """leaf_value with the static evaluation already computed."""
+        x = max(-30.0, min(30.0, score / self.p['win_temperature']))
+        return self._objective(2.0 / (1.0 + math.exp(-x)) - 1.0, self.est_multiplier(pos))
 
     def _tick(self):
         self.nodes += 1
-        if self.nodes % self.time_check_interval == 0 and time.perf_counter() >= self.deadline:
+        if self.nodes % self.time_check_interval == 0 and self._out_of_time():
             raise _Timeout()
 
     def _phase_limits(self, pos):
@@ -103,16 +184,7 @@ class Searcher(V16Searcher):
 
         # Stable state hash gives the same sample sequence for every candidate
         # action from this position, reducing noise in action comparisons.
-        seed = 2166136261
-        values = (*pos.b, *pos.pool, pos.hp[0], pos.hp[1], pos.turn, pos.flip)
-        for value in values:
-            if isinstance(value, float):
-                parts = value.as_integer_ratio()
-            else:
-                parts = (int(value),)
-            for part in parts:
-                seed = ((seed ^ part) * 16777619) & 0xFFFFFFFF
-        offset = random.Random(seed).random()
+        offset = _sample_offset(pos)
         points = [(i + offset) * remaining_size / sample_count
                   for i in range(sample_count)]
         sampled = {code: 0 for code in remaining}
@@ -140,6 +212,10 @@ class Searcher(V16Searcher):
         # tactical captures first, then let flips compete before quiet moves.
         tactical = [m for m in moves if m[0] in (CAPTURE, CANNON_HIDDEN)]
         flips = [m for m in moves if m[0] == FLIP]
+        if ply >= self.p['full_chance_plies']:
+            # Approximate flips leave the board untouched, so every flip square
+            # leads to the same child position; searching one is enough.
+            flips = flips[:1]
         quiet = [m for m in moves if m[0] == MOVE]
         ordered = tactical[:]
         for i in range(max(len(flips), len(quiet))):
@@ -150,7 +226,7 @@ class Searcher(V16Searcher):
         if tt_best in ordered:
             ordered.remove(tt_best)
             ordered.insert(0, tt_best)
-        if time.perf_counter() >= self.deadline:
+        if self._out_of_time():
             raise _Timeout()
         return ordered
 
@@ -210,7 +286,7 @@ class Searcher(V16Searcher):
                 it_best, it_value = None, float('-inf')
                 try:
                     for m in ordered:
-                        if time.perf_counter() >= self.deadline:
+                        if self._out_of_time():
                             raise _Timeout()
                         v = self.child_value(pos, m, depth, alpha, float('inf'), 0)
                         if v > it_value:
@@ -221,15 +297,13 @@ class Searcher(V16Searcher):
                     timed_out = True
                     break
                 best, best_value, depth_done = it_best, it_value, depth
+                self._report(pos, best, best_value, depth)
         timed_out = timed_out or time.perf_counter() >= self.deadline
         info = {'source': 'search', 'depth': depth_done, 'score': best_value,
                 'nodes': self.nodes, 'timed_out': timed_out,
                 'multiplier': pos.multiplier()}
         if best_value is not None:
-            v = best_value / self.est_multiplier(pos) ** self.lam
-            if v < 0:
-                v /= self.kappa
-            info['win_prob'] = max(0.0, min(1.0, (v + 1) / 2))
+            info['win_prob'] = self.win_prob(pos, best_value)
         return best, info
 
     def qsearch(self, pos, alpha, beta, ply, qdepth, hidden_left=None):
@@ -238,7 +312,8 @@ class Searcher(V16Searcher):
             return 0.0
         if pos.winner >= 0:
             return self.terminal_value(pos, ply)
-        stand = self.leaf_value(pos)
+        score = self.static_eval(pos)
+        stand = self._value_from_eval(pos, score)
         if qdepth <= 0 or stand >= beta:
             return stand
         if stand > alpha:
@@ -247,9 +322,18 @@ class Searcher(V16Searcher):
         b = pos.b
         caps = pos.captures()
         caps.sort(key=lambda ac: HPC[b[ac[1]]] * 20 - T_RANK[TYPE[b[ac[0]]]], reverse=True)
+        delta = self.delta_margin >= 0
         for a, c in caps:
+            gain = HPC[b[c]] + self.pv[TYPE[b[c]]] + self.delta_margin
             u = pos.do_move(a, c)
             try:
+                # The objective is monotone in the evaluation for a fixed
+                # multiplier, so bound the child by an optimistic evaluation
+                # using the post-capture multiplier. Game-ending captures are
+                # always searched.
+                if (delta and pos.winner < 0
+                        and self._value_from_eval(pos, score + gain) <= alpha):
+                    continue
                 v = -self.qsearch(pos, -beta, -alpha, ply + 1, qdepth - 1, hidden_left)
             finally:
                 pos.undo(u)
@@ -305,9 +389,11 @@ class StrategicV17AI:
         self.params.update({k: v for k, v in DEFAULT_PARAMS.items()
                             if k not in self.params})
         self.last_decision_info = None
+        self.on_progress = None
+        self.should_stop = None
+
+    def searcher(self):
+        return Searcher(self.params)
 
     def get_move(self, game):
-        pos = Position.from_game(game)
-        move, info = Searcher(self.params).choose(pos, self.time_budget_ms)
-        self.last_decision_info = info
-        return move_to_action(move) if move else None
+        return run_search(self, self.searcher(), game)

@@ -6,11 +6,13 @@
   "go_threads": 4,
   "rules": {
     "long_chase_limit": 5,
-    "no_capture_limit": 16
+    "no_capture_limit": 30
   },
   "think_time_sec": 4.0,
+  "ai_think_time_sec": 2.0,
+  "hint_min_depth": 4,
   "hint_side": "red",
-  "show_hint_on_board": true,
+  "show_hint_on_board": false,
   "ai_move_delay_ms": 400,
   "search": {
     "max_iterative_depth": 7,
@@ -85,7 +87,10 @@
       "tempo": 0.5
     },
     "q_hidden_caps": 1,
-    "q_hidden_depth": 1,
+    "q_hidden_depth": 0,
+    "delta_margin": 6.0,
+    "eval_cache_size": 200000,
+    "cannon_endgame_value": 2.0,
     "time_check_interval": 32,
     "early_pool_threshold": 20,
     "mid_pool_threshold": 12,

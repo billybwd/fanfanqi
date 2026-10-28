@@ -438,6 +438,9 @@ class Searcher:
         self.tt = {}
         self.nodes = 0
         self.deadline = INF
+        # on_progress(move, info)：每完成一层迭代调用一次；should_stop()：返回 True 时尽快结束搜索
+        self.on_progress = None
+        self.should_stop = None
 
     # -------------------------------------------------------- 评估
     def static_eval(self, pos):
@@ -505,6 +508,78 @@ class Searcher:
             score += -danger if s == me else danger
 
         return score + w['tempo']
+
+    def eval_terms(self, pos):
+        """static_eval 拆成 {权重名: 特征值}，满足 Σ 权重 × 特征值 == static_eval（用于 Texel 拟合）。
+
+        子力项的键为 'piece_value.<类型>'。'hanging' / 'hanging_one' / 'pool' 的特征值里含当前子力值，
+        对子力而言不是线性的，拟合时按固定特征处理。必须与 static_eval 保持一致（tests/selfplay 有校验）。
+        """
+        b = pos.b
+        me = pos.turn
+        op = me ^ 1
+        pv = self.pv
+        terms = {f'piece_value.{t}': 0.0 for t in TYPES}
+        for key in ('mobility', 'hanging', 'hanging_one', 'pool', 'king_soldier_adj', 'king_soldier_near',
+                    'king_cannon', 'king_trapped'):
+            terms[key] = 0.0
+        terms['hp'] = pos.hp[me] - pos.hp[op]
+        terms['tempo'] = 1.0
+        kings = [-1, -1]
+        soldiers = ([], [])
+        cannons = ([], [])
+        threatened = []
+        for sq in range(NSQ):
+            p = b[sq]
+            if p == EMPTY or p == HIDDEN:
+                continue
+            s = SIDE[p]
+            t = TYPE[p]
+            sign = 1 if s == me else -1
+            terms[f'piece_value.{TYPES[t]}'] += sign
+            if t == KING:
+                kings[s] = sq
+            elif t == SOLDIER:
+                soldiers[s].append(sq)
+            elif t == CANNON:
+                cannons[s].append(sq)
+            if t != CANNON:
+                for n in NEIGH[sq]:
+                    if b[n] == EMPTY:
+                        terms['mobility'] += sign
+            if s == me and pos.attacked(sq, p):
+                threatened.append(HPC[p] + pv[t])
+        if threatened:
+            biggest = max(threatened)
+            terms['hanging'] = -(sum(threatened) - biggest)
+            terms['hanging_one'] = -biggest
+        for c in CODES:
+            if pos.pool[c]:
+                terms['pool'] += (1 if SIDE[c] == me else -1) * pos.pool[c] * pv[TYPE[c]]
+        for s in (me, op):
+            k = kings[s]
+            if k < 0:
+                continue
+            sign = -1 if s == me else 1
+            for sq2 in soldiers[s ^ 1]:
+                d = DIST[k][sq2]
+                if d == 1:
+                    terms['king_soldier_adj'] += sign
+                elif d == 2:
+                    terms['king_soldier_near'] += sign
+            for sq2 in cannons[s ^ 1]:
+                if pos.cannon_hits(sq2, k):
+                    terms['king_cannon'] += sign
+            free = sum(1 for n in NEIGH[k] if b[n] == EMPTY)
+            if free < 2:
+                terms['king_trapped'] += sign * (2 - free)
+        return terms
+
+    def term_weights(self):
+        """与 eval_terms 的键对应的当前权重。"""
+        weights = {k: v for k, v in self.w.items() if k != 'piece_value'}
+        weights.update({f'piece_value.{t}': self.pv[i] for i, t in enumerate(TYPES)})
+        return weights
 
     def est_multiplier(self, pos):
         m = pos.combo_factor() * (pos.flip + pos.hp_diff())
@@ -623,8 +698,24 @@ class Searcher:
     # -------------------------------------------------------- 搜索
     def _tick(self):
         self.nodes += 1
-        if (self.nodes & 255) == 0 and time.perf_counter() > self.deadline:
+        if (self.nodes & 255) == 0 and self._out_of_time():
             raise _Timeout()
+
+    def _out_of_time(self):
+        return time.perf_counter() > self.deadline or (self.should_stop is not None and self.should_stop())
+
+    def win_prob(self, pos, value):
+        """把搜索值换算回预估胜率。"""
+        v = value / self.est_multiplier(pos) ** self.lam
+        if v < 0:
+            v /= self.kappa
+        return max(0.0, min(1.0, (v + 1) / 2))
+
+    def _report(self, pos, move, value, depth):
+        if self.on_progress is not None:
+            self.on_progress(move, {'source': 'search', 'depth': depth, 'score': value, 'nodes': self.nodes,
+                                    'multiplier': pos.multiplier(), 'win_prob': self.win_prob(pos, value),
+                                    'partial': True})
 
     def child_value(self, pos, move, depth, alpha, beta, ply):
         kind, a, c = move
@@ -744,15 +835,13 @@ class Searcher:
                 except _Timeout:
                     break
                 best, best_value, depth_done = it_best, it_value, depth
-                if time.perf_counter() > self.deadline:
+                if self._out_of_time():
                     break
+                self._report(pos, best, best_value, depth)
         info = {'source': 'search', 'depth': depth_done, 'score': best_value, 'nodes': self.nodes,
                 'multiplier': pos.multiplier()}
         if best_value is not None:
-            v = best_value / self.est_multiplier(pos) ** self.lam
-            if v < 0:
-                v /= self.kappa
-            info['win_prob'] = max(0.0, min(1.0, (v + 1) / 2))
+            info['win_prob'] = self.win_prob(pos, best_value)
         return best, info
 
 
@@ -792,9 +881,20 @@ class StrategicV16AI:
         self.time_budget_ms = 900
         self.params = merge_params(params)
         self.last_decision_info = None
+        # on_progress(action, info)：每完成一层迭代回调当前最佳动作；should_stop()：返回 True 时提前结束
+        self.on_progress = None
+        self.should_stop = None
 
     def get_move(self, game):
-        pos = Position.from_game(game)
-        move, info = Searcher(self.params).choose(pos, self.time_budget_ms)
-        self.last_decision_info = info
-        return move_to_action(move) if move else None
+        return run_search(self, Searcher(self.params), game)
+
+
+def run_search(player, searcher, game):
+    """用 searcher 为 player 搜索 game，接上进度回调 / 取消，返回动作。"""
+    pos = Position.from_game(game)
+    if player.on_progress is not None:
+        searcher.on_progress = lambda move, info: player.on_progress(move_to_action(move), info)
+    searcher.should_stop = player.should_stop
+    move, info = searcher.choose(pos, player.time_budget_ms)
+    player.last_decision_info = info
+    return move_to_action(move) if move else None

@@ -111,6 +111,8 @@ class App:
         self.long_chase_var = tk.IntVar(value=max(2, int(rules.get('long_chase_limit', DEFAULT_LONG_CHASE_LIMIT))))
         self.no_capture_var = tk.IntVar(value=max(1, int(rules.get('no_capture_limit', DEFAULT_NO_CAPTURE_LIMIT))))
         self.budget_var = tk.DoubleVar(value=cfg['think_time_sec'])
+        self.ai_budget_var = tk.DoubleVar(value=cfg['ai_think_time_sec'])
+        self.hint_depth_var = tk.IntVar(value=max(0, int(cfg['hint_min_depth'])))
         self.hint_side_var = tk.StringVar(value=HINT_SIDE_LABELS.get(cfg['hint_side'], '双方'))
         self.show_on_board_var = tk.BooleanVar(value=cfg['show_hint_on_board'])
 
@@ -136,10 +138,24 @@ class App:
         return self.mode == 'vs'
 
     def think_budget_ms(self):
+        """提示的思考时间。"""
         try:
             return max(100, float(self.budget_var.get()) * 1000)
         except (tk.TclError, ValueError):
             return self.config['think_time_sec'] * 1000
+
+    def ai_think_budget_ms(self):
+        """人机对战中电脑走子的思考时间。"""
+        try:
+            return max(100, float(self.ai_budget_var.get()) * 1000)
+        except (tk.TclError, ValueError):
+            return self.config['ai_think_time_sec'] * 1000
+
+    def hint_min_depth(self):
+        try:
+            return min(20, max(0, int(self.hint_depth_var.get())))
+        except (tk.TclError, ValueError):
+            return self.config['hint_min_depth']
 
     def hint_sides(self):
         sides = HINT_SIDE_VALUES[_key_of(HINT_SIDE_LABELS, self.hint_side_var.get())]
@@ -169,6 +185,8 @@ class App:
                 'no_capture_limit': DEFAULT_NO_CAPTURE_LIMIT,
             }
         cfg['think_time_sec'] = self.think_budget_ms() / 1000
+        cfg['ai_think_time_sec'] = self.ai_think_budget_ms() / 1000
+        cfg['hint_min_depth'] = self.hint_min_depth()
         cfg['hint_side'] = _key_of(HINT_SIDE_LABELS, self.hint_side_var.get())
         cfg['show_hint_on_board'] = bool(self.show_on_board_var.get())
         save_config(cfg)
@@ -314,11 +332,23 @@ class App:
         no_capture_spin.grid(row=row, column=1, sticky='w', pady=2)
         no_capture_spin.bind('<FocusOut>', self.on_rule_setting_changed)
         row += 1
-        ttk.Label(cfg, text='思考时间(秒)').grid(row=row, column=0, sticky='w')
+        ttk.Label(cfg, text='提示思考时间(秒)').grid(row=row, column=0, sticky='w')
         spin = ttk.Spinbox(cfg, from_=0.3, to=30, increment=0.5, textvariable=self.budget_var, width=8,
                            command=self.save_settings)
         spin.grid(row=row, column=1, sticky='w', pady=2)
         spin.bind('<FocusOut>', lambda _e: self.save_settings())
+        row += 1
+        ttk.Label(cfg, text='提示起始层数').grid(row=row, column=0, sticky='w')
+        depth_spin = ttk.Spinbox(cfg, from_=0, to=20, increment=1, textvariable=self.hint_depth_var, width=8,
+                                 command=self.save_settings)
+        depth_spin.grid(row=row, column=1, sticky='w', pady=2)
+        depth_spin.bind('<FocusOut>', lambda _e: self.save_settings())
+        row += 1
+        ttk.Label(cfg, text='电脑思考时间(秒)').grid(row=row, column=0, sticky='w')
+        self.ai_budget_spin = ttk.Spinbox(cfg, from_=0.3, to=30, increment=0.5, textvariable=self.ai_budget_var,
+                                          width=8, command=self.save_settings)
+        self.ai_budget_spin.grid(row=row, column=1, sticky='w', pady=2)
+        self.ai_budget_spin.bind('<FocusOut>', lambda _e: self.save_settings())
         row += 1
         ttk.Label(cfg, text='提示方').grid(row=row, column=0, sticky='w')
         side_box = ttk.Combobox(cfg, textvariable=self.hint_side_var, values=list(HINT_SIDE_LABELS.values()),
@@ -330,7 +360,9 @@ class App:
                         command=lambda: (self.save_settings(), self.draw_board())).grid(
             row=row, column=0, columnspan=2, sticky='w')
         row += 1
-        ttk.Label(cfg, text='思考时间对 V15、V16、V17（迭代加深）生效；\n人机对战中提示只针对玩家一方',
+        ttk.Label(cfg, text='思考时间对 V15、V16、V17（迭代加深）生效；\n'
+                            'V16/V17 搜到起始层数即先给提示，之后随深度更新（0 = 只给最终结果）；\n'
+                            '电脑思考时间只用于人机对战；人机对战中提示只针对玩家一方',
                   foreground='#888888').grid(row=row, column=0, columnspan=2, sticky='w')
         self.update_engine_widgets()
 
@@ -371,6 +403,7 @@ class App:
     def update_mode_widgets(self):
         state = 'readonly' if self.is_vs() else 'disabled'
         self.player_side_box.configure(state=state)
+        self.ai_budget_spin.configure(state='normal' if self.is_vs() else 'disabled')
 
     # -------------------------------------------------------------- drawing
     def cell_rect(self, row, col):
@@ -535,7 +568,8 @@ class App:
         if purpose:
             token = self.ai_token
             model = self.model_var.get()
-            budget_ms = self.think_budget_ms()
+            budget_ms = self.ai_think_budget_ms() if purpose == 'move' else self.think_budget_ms()
+            min_depth = self.hint_min_depth() if purpose == 'hint' else 0
             search = dict(self.config['search'])
             v16_params = self.config['v16']
             v17_params = self.config['v17']
@@ -549,8 +583,11 @@ class App:
 
             def worker():
                 try:
+                    # 局面一变（token 过期）就停止计算，不和新的计算抢 CPU
                     result = compute_hint(snapshot, model, budget_ms, search, v16_params, v17_params,
-                                          engine, threads)
+                                          engine, threads, min_depth=min_depth,
+                                          on_progress=lambda h: self.ai_queue.put((token, 'hint_progress', h)),
+                                          should_stop=lambda: token != self.ai_token)
                 except Exception as exc:  # noqa: BLE001 — AI 出错不应影响对局
                     result = {'error': f'{type(exc).__name__}: {exc}'}
                 self.ai_queue.put((token, purpose, result))
@@ -565,7 +602,13 @@ class App:
                 token, purpose, result = self.ai_queue.get_nowait()
                 if token != self.ai_token:
                     continue
-                if purpose == 'hint':
+                if purpose == 'hint_progress':
+                    # 中间结果只在最终结果到达前显示，随深度更新
+                    if self.hint is None or (self.hint.get('info') or {}).get('partial'):
+                        self.hint = result
+                        self.update_hint_panel()
+                        self.draw_board()
+                elif purpose == 'hint':
                     self.hint = result
                     self.update_hint_panel()
                     self.draw_board()
@@ -615,10 +658,12 @@ class App:
             self.hint_text_var.set('')
             self.hint_meta_var.set(self.hint['error'])
             return
-        self.hint_title_var.set(f"{self.hint['side_name']} · {self.hint['model']} 建议：")
-        self.hint_text_var.set(self.hint['text'])
-        meta = [f"用时 {self.hint['elapsed_ms'] / 1000:.1f}s"]
         info = self.hint.get('info')
+        partial = bool(info and info.get('partial'))
+        suffix = '当前建议（继续计算中）：' if partial else '建议：'
+        self.hint_title_var.set(f"{self.hint['side_name']} · {self.hint['model']} {suffix}")
+        self.hint_text_var.set(self.hint['text'])
+        meta = [f"{'已用' if partial else '用时'} {self.hint['elapsed_ms'] / 1000:.1f}s"]
         if info:
             if info.get('source') == 'tactical':
                 meta.append('依据：紧急战术（护将 / 防兵杀 / 强制吃子）')

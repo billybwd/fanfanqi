@@ -14,6 +14,8 @@ import time
 
 from fanfanqi.advisor import AI_MODELS, create_ai
 from fanfanqi.game import Game, make_piece, other_side
+from fanfanqi.v16 import Position, Searcher as V16Searcher, merge_params
+from fanfanqi.v17 import StrategicV17AI
 
 
 def random_setup(game):
@@ -45,9 +47,13 @@ class RandomAI:
 
 def make_player(name, side, budget_ms):
     """name 可写成 StrategicV16AI:λ 或 StrategicV16AI:λ,κ（如 StrategicV16AI:0.5,1.5），
-    冒号后为 V16 的 multiplier_exponent / loss_aversion；也接受旧写法 :reward / :win。"""
+    冒号后为 V16 的 multiplier_exponent / loss_aversion；也接受旧写法 :reward / :win。
+    前缀 go/ 使用 Go 引擎（单线程），如 go/StrategicV17AI。"""
     if name == 'random':
         return RandomAI(side)
+    engine = 'python'
+    if name.startswith('go/'):
+        engine, name = 'go', name[3:]
     model, _, objective = name.partition(':')
     strategy_params = None
     if objective in ('reward', 'win'):
@@ -58,11 +64,12 @@ def make_player(name, side, budget_ms):
         if kappa:
             strategy_params['loss_aversion'] = float(kappa)
     if model == 'StrategicV17AI':
-        return create_ai(model, side, budget_ms, v17_params=strategy_params)
-    return create_ai(model, side, budget_ms, v16_params=strategy_params)
+        return create_ai(model, side, budget_ms, v17_params=strategy_params, engine=engine)
+    return create_ai(model, side, budget_ms, v16_params=strategy_params, engine=engine)
 
 
-def play_game(red_name, black_name, budget_ms=300, max_plies=300):
+def play_game(red_name, black_name, budget_ms=300, max_plies=300, record=None):
+    """record 为列表时，把每个走子前的局面（Game 副本）追加进去。"""
     game = Game()
     random_setup(game)
     players = {'red': make_player(red_name, 'red', budget_ms), 'black': make_player(black_name, 'black', budget_ms)}
@@ -70,6 +77,8 @@ def play_game(red_name, black_name, budget_ms=300, max_plies=300):
     while game.phase == 'playing' and plies < max_plies:
         side = game.current_turn
         work = game.clone()
+        if record is not None:
+            record.append(game.clone())
         action = players[side].get_move(work)
         if action is None:
             break
@@ -155,9 +164,22 @@ def run_tests():
         check(f'{name} 返回合法动作（{(time.perf_counter() - t) * 1000:.0f}ms）', legal)
 
     print('V17 完整自对弈（随机翻子）')
+    positions = []
     for _ in range(2):
-        winner, plies, _ = play_game('StrategicV17AI', 'StrategicV17AI', 150)
+        winner, plies, _ = play_game('StrategicV17AI', 'StrategicV17AI', 150, record=positions)
         check(f'对局完整结束：{winner}，{plies} 步', winner in ('red', 'black', 'draw') and plies > 0)
+
+    print('评估特征（Texel 拟合用）与 static_eval 一致')
+    for name, searcher in (('V16', V16Searcher(merge_params(None))),
+                           ('V17', StrategicV17AI('red').searcher())):
+        worst = 0.0
+        for game in positions:
+            pos = Position.from_game(game)
+            score = searcher.static_eval(pos)
+            weights = searcher.term_weights()
+            total = sum(weights[k] * v for k, v in searcher.eval_terms(pos).items())
+            worst = max(worst, abs(total - score))
+        check(f'{name}：{len(positions)} 个局面最大误差 {worst:.1e}', worst < 1e-9)
 
     print(f'\n{"全部通过" if failures == 0 else f"{failures} 项失败"}')
     return failures
