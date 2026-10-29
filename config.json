@@ -15,6 +15,7 @@
   "show_hint_on_board": true,
   "ponder": false,
   "ponder_time_sec": 30,
+  "save_failed_frames": true,
   "ai_move_delay_ms": 400,
   "search": {
     "max_iterative_depth": 7,
