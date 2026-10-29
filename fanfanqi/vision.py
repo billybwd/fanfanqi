@@ -15,6 +15,7 @@ game_from_state() 校验（明子 + 被吃 ≤ 总数、暗子数 = 剩余池、
 """
 
 import argparse
+from itertools import product
 import json
 import os
 import time
@@ -290,13 +291,24 @@ def badge_present(rgb, layout, col, row):
     return len(px) > 0 and float(((px[:, 0] > 170) & (px[:, 1] < 110)).mean()) >= BADGE_MIN
 
 
-def badge_tile(rgb, layout, col, row):
-    return _resize(layout.crop(rgb, col + 0.2, row - 0.2, 0.24, 0.24), (16, 16))
+def badge_tile(rgb, layout, col, row, size=0.24):
+    return _resize(layout.crop(rgb, col + 0.2, row - 0.2, size, size), (16, 16))
 
 
 def button_tile(rgb, layout):
     patch = layout.crop(rgb, *BUTTON_BOX)
     return None if patch is None else _resize(patch, (96, 20))
+
+
+def _center_dialog(rgb, layout):
+    """检测覆盖棋盘中央的浅色系统弹窗（例如重新登录确认框）。"""
+    patch = layout.crop(rgb, 2.0, 4.0, 3.0, 3.0)
+    if patch is None:
+        return False
+    px = patch.astype(np.int16)
+    # 弹窗底色偏浅且接近中性白；正常木纹棋盘的蓝通道明显更低。
+    light_neutral = (px[..., 0] > 200) & (px[..., 1] > 185) & (px[..., 2] > 165)
+    return float(light_neutral.mean()) >= 0.18
 
 
 # --------------------------------------------------------------- 模板
@@ -352,6 +364,7 @@ class Recognition:
     last_move: dict = None                           # {'from': (r, c) 或 None, 'to': (r, c)}；from 为 None 表示翻子
     turn_certain: bool = False                       # turn 是否有绿框等直接依据（False 表示换手过渡中，按“下方没绿框就不是自己”推的）
     game_over: bool = False
+    board_obscured: bool = False                      # 棋盘中央有特效/弹窗遮挡，不能把识别结果用于同步
     quality: float = 1.0                             # 有子格中字形匹配可信的比例
     problems: list = field(default_factory=list)     # 不自洽、没把握的地方
     notes: list = field(default_factory=list)        # 按规则自动修正过的地方
@@ -449,10 +462,12 @@ def recognize(image, templates=None, layout=None):
         raise ValueError('没有找到棋盘')
     result = Recognition(layout=layout)
     result.game_over = templates.is_button(button_tile(rgb, layout))
+    center_dialog = _center_dialog(rgb, layout)
 
     # 棋盘
     froms, tos = [], []
     occupied = good = 0
+    central_bad_glyphs = 0
     for row in range(ROWS):
         tokens = []
         for col in range(COLS):
@@ -484,8 +499,13 @@ def recognize(image, templates=None, layout=None):
                 good += 1
             elif not result.game_over:
                 result.problems.append(f'第 {row} 行第 {col} 列：识别为 {tokens[-1]} 但把握不大（距离 {d:.2f}）')
+            # 结算动画（如“获胜”大字）会覆盖棋盘中央。遮挡纹理通常与棋子字形
+            # 差异很大；聚集出现时整帧应丢弃，不能将这些格子当成真实棋子。
+            if 2 <= row <= 5 and d >= 0.95:
+                central_bad_glyphs += 1
         result.board.append(tokens)
     result.quality = good / occupied if occupied else 0.0
+    result.board_obscured = center_dialog or (central_bad_glyphs >= 3 and result.quality < 0.8)
     if len(tos) == 1:
         result.last_move = {'from': froms[0] if len(froms) == 1 else None, 'to': tos[0]}
 
@@ -515,7 +535,11 @@ def recognize(image, templates=None, layout=None):
                 continue
             n = 1
             if badge_present(rgb, layout, col, row):
-                n, d = templates.badge_count(badge_tile(rgb, layout, col, row))
+                # 数字很小，图标大小/缩放略有变化时单一裁剪框容易切掉笔画；
+                # 用几个相邻尺度匹配，选与现有数字模板最接近的一次。
+                matches = [templates.badge_count(badge_tile(rgb, layout, col, row, size))
+                           for size in (0.20, 0.24, 0.28)]
+                n, d = min(matches, key=lambda item: item[1])
                 if n is None:
                     n = 2
                     result.problems.append('没有数量角标模板，按 2 个计')
@@ -544,23 +568,59 @@ def recognize(image, templates=None, layout=None):
         if sides[name] in result.captured:
             result.captured[sides[name]].update(counts)
 
-    if not result.game_over:  # 结算界面的按钮挡住了几格，空格数不可靠
-        if len(soldier_badges) == 1:
-            _fix_soldier_count(result, sides[soldier_badges[0]])
+    if not result.game_over and not result.board_obscured:  # 结算界面/特效挡住棋盘时空格数不可靠
+        badge_sides = [sides[name] for name in soldier_badges if sides.get(name) in result.captured]
+        if badge_sides:
+            _fix_soldier_count(result, badge_sides)
         _check(result)
     return result
 
 
-def _fix_soldier_count(result, side):
-    """空格数 = 被吃总数。只有一方的兵/卒带数量角标时，用这个关系核对角标数字（3 和 5 容易认混）。"""
+def _fix_soldier_count(result, sides):
+    """用空格总数和血量条联合核对兵/卒角标，避免只在单个角标时才能纠错。"""
+    from .game import INITIAL_HP
+    from .state import lost_hp
+
+    if isinstance(sides, str):  # 兼容旧调用方式
+        sides = [sides]
+    sides = list(dict.fromkeys(sides))
     empty = sum(row.count('.') for row in result.board)
-    pieces = result.captured.get(side, {})
+    current = {side: result.captured[side].get('兵', 0) for side in sides}
     total = sum(sum(c.values()) for c in result.captured.values())
-    fixed = pieces.get('兵', 0) + empty - total
-    if fixed != pieces.get('兵') and 2 <= fixed <= 5:
-        name = '红' if side == 'red' else '黑'
-        result.notes.append(f"{name}方被吃兵/卒的数量角标识别为 {pieces.get('兵')}，按空格数修正为 {fixed}")
-        pieces['兵'] = fixed
+    if total == empty:
+        return
+
+    candidates = []
+    for counts in product(range(2, 6), repeat=len(sides)):
+        adjusted_total = total + sum(counts[i] - current[side] for i, side in enumerate(sides))
+        if adjusted_total != empty:
+            continue
+        hp_error = 0
+        for side in ('red', 'black'):
+            shown = result.hp_bar.get(side)
+            if shown is None:
+                continue
+            captured = dict(result.captured[side])
+            if side in sides:
+                captured['兵'] = counts[sides.index(side)]
+            derived = INITIAL_HP - lost_hp(captured)
+            hp_error += max(0, abs(shown - derived) - 1)
+        changed = sum(abs(counts[i] - current[side]) for i, side in enumerate(sides))
+        candidates.append(((hp_error, changed), counts))
+
+    if not candidates:
+        return
+    candidates.sort(key=lambda item: item[0])
+    best_score = candidates[0][0]
+    best = [counts for score, counts in candidates if score == best_score]
+    if len(best) != 1:
+        return  # 缺少足够证据时不猜数字
+    for i, side in enumerate(sides):
+        fixed = best[0][i]
+        if fixed != current[side]:
+            name = '红' if side == 'red' else '黑'
+            result.notes.append(f"{name}方被吃兵/卒角标由 {current[side]} 修正为 {fixed}（空格数与血量条校验）")
+            result.captured[side]['兵'] = fixed
 
 
 def _check(result):

@@ -302,8 +302,11 @@ class ScreenWatcher(threading.Thread):
             if due and (settled or busy_too_long or not dirty):
                 recognized_at = started
                 rec = vision.recognize(rgb, templates, layout)
-                if self.save_failed and settled and rec.problems and not rec.game_over:
+                if self.save_failed and settled and rec.problems and not rec.game_over and not rec.board_obscured:
                     self._save_failed(vision, rgb, layout, rec, started)
+                if rec.board_obscured:
+                    # 动画/弹窗覆盖棋盘时，保留当前同步局面，等画面恢复后再识别。
+                    continue
                 if not rec.game_over and rec.quality < vision.GOOD_QUALITY:
                     poor += 1
                     if poor >= 2:  # 连续两次对不上：棋盘移动了或被遮挡，重新找

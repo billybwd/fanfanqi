@@ -1,5 +1,5 @@
 {
-  "mode": "record",
+  "mode": "vs",
   "player_side": "red",
   "ai_model": "StrategicV17AI",
   "engine": "go",
@@ -8,11 +8,11 @@
     "long_chase_limit": 5,
     "no_capture_limit": 30
   },
-  "think_time_sec": 5.0,
+  "think_time_sec": 4.0,
   "ai_think_time_sec": 2.0,
-  "hint_min_depth": 5,
+  "hint_min_depth": 6,
   "hint_side": "red",
-  "show_hint_on_board": true,
+  "show_hint_on_board": false,
   "ponder": false,
   "ponder_time_sec": 30,
   "save_failed_frames": true,
