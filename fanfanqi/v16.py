@@ -25,7 +25,7 @@ DEFAULT_PARAMS = {
     'loss_aversion': 1.0,
     # 评估分（HP 单位）换算胜率的温度：胜率 = sigmoid(评估分 / 温度)
     'win_temperature': 12.0,
-    'max_depth': 8,
+    'max_depth': 20,
     # 根节点 / 内部节点最多考虑几个翻子位置；内部节点最多几个非吃子着法
     'root_flips': 8,
     'node_flips': 3,

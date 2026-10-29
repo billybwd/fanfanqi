@@ -31,3 +31,6 @@ goengine/fanfanqi-engine
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local screenshots for screen recognition (contain other players' names and avatars)
+/sample_image/

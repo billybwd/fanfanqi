@@ -1,5 +1,6 @@
-"""Adapter for the optional Go search engine."""
+"""Adapter for the optional Go search engine (a long-lived process, see _EngineProcess)."""
 
+import collections
 import hashlib
 import json
 import os
@@ -56,6 +57,112 @@ def _engine_binary():
     return binary
 
 
+class _EngineProcess:
+    """常驻的 Go 引擎进程：一行一个请求，进程不退出，置换表跨请求保留（上一步、对手思考时算过的局面直接复用）。
+    同一进程内的请求按顺序执行；should_stop 为真时发 {"cmd":"stop"}，引擎立即返回当前最好的结果。"""
+
+    def __init__(self, binary):
+        self.binary = binary
+        self.proc = None
+        self.lock = threading.Lock()        # 一次只跑一个请求
+        self.write_lock = threading.Lock()  # 请求和 stop 命令可能来自不同线程
+        self.stderr_tail = collections.deque(maxlen=200)
+
+    def _start(self):
+        self.proc = subprocess.Popen(
+            [str(self.binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', errors='replace', bufsize=1,
+        )
+        proc, tail = self.proc, self.stderr_tail
+        tail.clear()
+        # 持续读走 stderr，避免管道写满卡住引擎
+        threading.Thread(target=lambda: tail.extend(proc.stderr), daemon=True).start()
+
+    def _send(self, proc, message):
+        with self.write_lock:
+            proc.stdin.write(json.dumps(message, ensure_ascii=False) + '\n')
+            proc.stdin.flush()
+
+    def _kill(self):
+        if self.proc is not None:
+            self.proc.kill()
+            self.proc.wait()
+            self.proc = None
+
+    def run(self, request, on_progress, should_stop, timeout_s):
+        """返回 (response, stopped)。"""
+        with self.lock:
+            for attempt in range(2):
+                if self.proc is None or self.proc.poll() is not None:
+                    self._start()
+                proc = self.proc
+                try:
+                    self._send(proc, request)
+                except OSError:
+                    self._kill()  # 进程已退出（例如上次被看门狗结束），重启后再试一次
+                    if attempt:
+                        raise
+                    continue
+                return self._read(proc, on_progress, should_stop, timeout_s)
+
+    def _read(self, proc, on_progress, should_stop, timeout_s):
+        ended = threading.Event()
+        why = {}
+
+        def watch():
+            deadline = time.monotonic() + timeout_s
+            while not ended.wait(0.05):
+                if should_stop is not None and not why.get('stopped') and should_stop():
+                    why['stopped'] = True
+                    try:
+                        self._send(proc, {'cmd': 'stop'})
+                    except OSError:
+                        pass
+                elif time.monotonic() > deadline:
+                    why['timeout'] = True
+                    proc.kill()  # stdout 随之关闭，下面的读循环结束
+                    return
+
+        threading.Thread(target=watch, daemon=True).start()
+        response, lines = None, []
+        try:
+            for line in proc.stdout:
+                lines.append(line)
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if 'progress' in message:
+                    if on_progress is not None:
+                        progress = message['progress']
+                        on_progress(progress.get('action'), progress.get('info') or {})
+                else:
+                    response = message
+                    break
+        finally:
+            ended.set()
+        if response is None:
+            self._kill()
+            if why.get('timeout'):
+                raise RuntimeError('Go 引擎进程超时')
+            detail = ''.join(self.stderr_tail).strip() or ''.join(lines).strip()
+            raise RuntimeError(f'Go 引擎意外退出：{detail[-500:] or proc.returncode}')
+        return response, bool(why.get('stopped'))
+
+
+_ENGINES = {}
+_ENGINES_LOCK = threading.Lock()
+
+
+def _engine_process():
+    binary = _engine_binary()
+    with _ENGINES_LOCK:
+        engine = _ENGINES.get(str(binary))
+        if engine is None:
+            engine = _ENGINES[str(binary)] = _EngineProcess(binary)
+        return engine
+
+
 class GoEngineAI:
     def __init__(self, model_name, side, time_budget_ms, params=None, threads=1):
         self.model_name = model_name
@@ -64,7 +171,7 @@ class GoEngineAI:
         self.params = params or {}
         self.threads = min(64, max(1, int(threads)))
         self.last_decision_info = None
-        # 与 StrategicV16AI / V17AI 相同：on_progress(action, info) 每完成一层回调；should_stop() 为 True 时结束引擎进程
+        # 与 StrategicV16AI / V17AI 相同：on_progress(action, info) 每完成一层回调；should_stop() 为 True 时停止搜索
         self.on_progress = None
         self.should_stop = None
 
@@ -77,58 +184,11 @@ class GoEngineAI:
             'params': self.params,
             'progress': self.on_progress is not None,
         }
-        proc = subprocess.Popen(
-            [str(_engine_binary())], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding='utf-8', errors='replace',
-        )
-        ended = threading.Event()
-        why = {}
-
-        def watch():
-            # 超时或被取消时结束引擎进程；stdout 随之关闭，下面的读循环自然结束
-            deadline = time.monotonic() + self.time_budget_ms / 1000 + 15
-            while not ended.wait(0.05):
-                if self.should_stop is not None and self.should_stop():
-                    why['stopped'] = True
-                elif time.monotonic() > deadline:
-                    why['timeout'] = True
-                else:
-                    continue
-                proc.kill()
-                return
-
-        watcher = threading.Thread(target=watch, daemon=True)
-        watcher.start()
-        response = None
-        lines = []
-        try:
-            proc.stdin.write(json.dumps(request, ensure_ascii=False) + '\n')
-            proc.stdin.close()
-            for line in proc.stdout:
-                lines.append(line)
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if 'progress' in message:
-                    if self.on_progress is not None:
-                        progress = message['progress']
-                        self.on_progress(progress.get('action'), progress.get('info') or {})
-                else:
-                    response = message
-            stderr = proc.stderr.read()
-            proc.wait()
-        finally:
-            ended.set()
-        if why.get('stopped'):
+        response, stopped = _engine_process().run(request, self.on_progress, self.should_stop,
+                                                  self.time_budget_ms / 1000 + 15)
+        if stopped:
             self.last_decision_info = {'source': 'search', 'stopped': True}
             return None
-        if why.get('timeout'):
-            raise RuntimeError('Go 引擎进程超时')
-        if proc.returncode:
-            raise RuntimeError(stderr.strip() or ''.join(lines).strip() or f'Go 引擎退出码 {proc.returncode}')
-        if response is None:
-            raise RuntimeError(f'Go 引擎返回了无效响应：{"".join(lines)[:300]}')
         if response.get('error'):
             raise RuntimeError(response['error'])
         self.last_decision_info = response.get('info')

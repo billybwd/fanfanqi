@@ -155,6 +155,7 @@ type State struct {
 	Rules map[string]int `json:"rules"`
 }
 type Request struct {
+	Cmd string `json:"cmd"` // "stop": interrupt the running search (it still answers with its best move so far)
 	Strategy string `json:"strategy"`
 	Threads int `json:"threads"`
 	TimeBudgetMS int `json:"time_budget_ms"`
@@ -416,6 +417,10 @@ type Searcher struct {
 	Lam, Kappa, Temp float64
 	MaxDepth, FullChancePlies, NodeQuietMoves, QDepth, QHiddenDepth, QHiddenCaps int
 	RootFlips, NodeFlips, EarlyPool, MidPool, EarlyRootFlips, MidRootFlips, EarlyNodeFlips, MidNodeFlips, EarlyChance, MidChance int
+	// Search extensions (search_ext): killer moves, principal variation search and late move reductions.
+	Ext bool
+	LmrDepth, LmrMoves int
+	killers [maxPly][2]Move
 	OnDepth func(best Move,value float64,depth int) // called after each completed iteration
 	bufs [maxPly]plyBuf
 	capBufs [maxPly][]Move
@@ -424,28 +429,47 @@ type TTEntry struct { Depth int; Value float64; Flag uint8; Best Move; HasBest b
 type scoredMove struct { Score float64; M Move }
 type timeoutPanic struct{}
 
-// TransTable is a fixed-size transposition table shared by all search threads (lazy SMP).
+// TransTable is a fixed-size transposition table shared by all search threads.
 // A slot stores key^value^meta, so a torn concurrent write fails the check and reads as a miss.
+// Each bucket has two slots: the first keeps the deeper entry (so the valuable entries near the root survive
+// millions of shallow stores and can be reused by the next request, e.g. after pondering), the second is
+// always replaced. The generation advances with every request; older entries of other positions give way.
 type ttSlot struct { check, value, meta atomic.Uint64 }
-type TransTable struct { slots []ttSlot; mask uint64 }
+type TransTable struct { slots []ttSlot; mask uint64; gen atomic.Uint64 }
 
 func newTransTable(bits int) *TransTable {
 	if bits < 10 { bits = 10 } else if bits > 26 { bits = 26 }
-	return &TransTable{slots: make([]ttSlot, 1<<bits), mask: uint64(1<<bits - 1)}
+	return &TransTable{slots: make([]ttSlot, 1<<bits), mask: uint64(1<<(bits-1) - 1)}
+}
+func (t *TransTable) nextGeneration() { t.gen.Add(1) }
+func (t *TransTable) read(slot *ttSlot) (key, v, m uint64) {
+	check, v, m := slot.check.Load(), slot.value.Load(), slot.meta.Load()
+	return check ^ v ^ m, v, m
 }
 func (t *TransTable) get(key uint64) (TTEntry, bool) {
-	slot := &t.slots[key&t.mask]
-	check, v, m := slot.check.Load(), slot.value.Load(), slot.meta.Load()
-	if m == 0 || check^v^m != key { return TTEntry{}, false }
-	e := TTEntry{Depth: int(m >> 1 & 0xff), Value: math.Float64frombits(v), Flag: uint8(m >> 9 & 3), HasBest: m>>11&1 == 1}
-	e.Best = Move{Kind: int(m >> 12 & 7), A: int(m >> 15 & 63), C: int(m >> 21 & 63)}
-	return e, true
+	i := key & t.mask * 2
+	for j := i; j < i+2; j++ {
+		k, v, m := t.read(&t.slots[j])
+		if m == 0 || k != key { continue }
+		e := TTEntry{Depth: int(m >> 1 & 0xff), Value: math.Float64frombits(v), Flag: uint8(m >> 9 & 3), HasBest: m>>11&1 == 1}
+		e.Best = Move{Kind: int(m >> 12 & 7), A: int(m >> 15 & 63), C: int(m >> 21 & 63)}
+		return e, true
+	}
+	return TTEntry{}, false
 }
 func (t *TransTable) put(key uint64, e TTEntry) {
-	m := uint64(1) | uint64(e.Depth&0xff)<<1 | uint64(e.Flag&3)<<9 | uint64(e.Best.Kind&7)<<12 | uint64(e.Best.A&63)<<15 | uint64(e.Best.C&63)<<21
+	gen := t.gen.Load() & 0xff
+	m := uint64(1) | uint64(e.Depth&0xff)<<1 | uint64(e.Flag&3)<<9 | uint64(e.Best.Kind&7)<<12 | uint64(e.Best.A&63)<<15 | uint64(e.Best.C&63)<<21 | gen<<27
 	if e.HasBest { m |= 1 << 11 }
 	v := math.Float64bits(e.Value)
-	slot := &t.slots[key&t.mask]
+	i := key & t.mask * 2
+	slot := &t.slots[i]
+	// Keep a deeper entry in the first slot: of the same position from any generation (iterative deepening
+	// re-searches shallow first and must not wipe out what an earlier, deeper request left behind), or of
+	// another position from the current generation. The new entry then goes to the always-replace slot.
+	if k, _, old := t.read(slot); old != 0 && int(old>>1&0xff) > e.Depth && (k == key || old>>27&0xff == gen) {
+		slot = &t.slots[i+1]
+	}
 	slot.value.Store(v); slot.meta.Store(m); slot.check.Store(key ^ v ^ m)
 }
 
@@ -453,7 +477,7 @@ func number(v any, fallback float64) float64 { if n,ok:=v.(float64); ok{return n
 func intParam(p map[string]any,key string,fallback int) int { return int(number(p[key],float64(fallback))) }
 func floatParam(p map[string]any,key string,fallback float64) float64 { return number(p[key],fallback) }
 func weightMap(p map[string]any) map[string]any { if w,ok:=p["weights"].(map[string]any);ok{return w};return nil }
-func defaultParams() map[string]any { return map[string]any{"multiplier_exponent":1.0,"loss_aversion":1.0,"win_temperature":12.0,"max_depth":8,"root_flips":8,"node_flips":3,"node_quiet_moves":10,"qsearch_depth":4,"full_chance_plies":1,"q_hidden_caps":1,"q_hidden_depth":0,"delta_margin":6.0,"eval_cache_size":200000,"cannon_endgame_value":2.0,"time_check_interval":32,"early_pool_threshold":20,"mid_pool_threshold":12,"early_root_flips":6,"mid_root_flips":7,"early_node_flips":2,"mid_node_flips":3,"early_chance_samples":6,"mid_chance_samples":8,"tt_bits":21} }
+func defaultParams() map[string]any { return map[string]any{"multiplier_exponent":1.0,"loss_aversion":1.0,"win_temperature":12.0,"max_depth":20,"root_flips":8,"node_flips":3,"node_quiet_moves":10,"qsearch_depth":4,"full_chance_plies":1,"q_hidden_caps":1,"q_hidden_depth":0,"delta_margin":6.0,"eval_cache_size":200000,"cannon_endgame_value":2.0,"time_check_interval":32,"early_pool_threshold":20,"mid_pool_threshold":12,"early_root_flips":6,"mid_root_flips":7,"early_node_flips":2,"mid_node_flips":3,"early_chance_samples":6,"mid_chance_samples":8,"tt_bits":21,"keep_tt":1,"search_ext":1,"lmr_min_depth":3,"lmr_moves":3} }
 func makeSearcher(params map[string]any,strategy int,deadline time.Time,tt *TransTable,stop *atomic.Bool) *Searcher {
 	d:=defaultParams(); for k,v:=range params {d[k]=v}; p:=d
 	wm:=weightMap(p); nested:=map[string]any{}; if raw,ok:=wm["piece_value"].(map[string]any);ok{nested=raw}
@@ -470,6 +494,7 @@ func makeSearcher(params map[string]any,strategy int,deadline time.Time,tt *Tran
 	s.RootFlips,s.NodeFlips,s.EarlyPool,s.MidPool=intParam(p,"root_flips",8),intParam(p,"node_flips",3),intParam(p,"early_pool_threshold",20),intParam(p,"mid_pool_threshold",12)
 	s.EarlyRootFlips,s.MidRootFlips,s.EarlyNodeFlips,s.MidNodeFlips=intParam(p,"early_root_flips",6),intParam(p,"mid_root_flips",7),intParam(p,"early_node_flips",2),intParam(p,"mid_node_flips",3)
 	s.EarlyChance,s.MidChance=intParam(p,"early_chance_samples",6),intParam(p,"mid_chance_samples",8)
+	s.Ext,s.LmrDepth,s.LmrMoves=intParam(p,"search_ext",1)!=0,intParam(p,"lmr_min_depth",3),intParam(p,"lmr_moves",3)
 	return s
 }
 func (s *Searcher) buf(ply int) *plyBuf { if ply<maxPly {return &s.bufs[ply]}; return &plyBuf{} }
@@ -526,8 +551,15 @@ func (s *Searcher) orderedMoves(p *Position,ply int,ttBest Move,hasTT bool) []Mo
 		tactical,quietMoves:=buf.tactical[:0],buf.quietMoves[:0];for _,x:=range scored{if x.M.Kind==captureKind||x.M.Kind==hiddenCaptureKind{tactical=append(tactical,x.M)}else{quietMoves=append(quietMoves,x.M)}};buf.tactical,buf.quietMoves=tactical,quietMoves
 		ordered=append(ordered,tactical...);for i:=0;i<max(len(flipScores),len(quietMoves));i++{if i<len(flipScores){ordered=append(ordered,flipScores[i].M)};if i<len(quietMoves){ordered=append(ordered,quietMoves[i])}}
 	} else {for _,x:=range scored{ordered=append(ordered,x.M)};for _,x:=range flipScores{ordered=append(ordered,x.M)}}
+	if s.Ext&&ply<maxPly{tactical:=0;for tactical<len(ordered)&&isTactical(ordered[tactical]){tactical++};for k:=1;k>=0;k--{if km:=s.killers[ply][k];km.Kind!=0||km.A!=0||km.C!=0{moveTo(ordered,km,tactical)}}}
 	if hasTT{moveToFront(ordered,ttBest)};buf.ordered=ordered;return ordered
 }
+func isTactical(m Move) bool { return m.Kind==captureKind||m.Kind==hiddenCaptureKind }
+// moveTo moves m (if present at or after pos) to index pos, shifting the moves in between back.
+func moveTo(moves []Move,m Move,pos int) { for i:=pos;i<len(moves);i++ { if moves[i]==m { copy(moves[pos+1:i+1],moves[pos:i]); moves[pos]=m; return } } }
+func (s *Searcher) addKiller(m Move,ply int) { if isTactical(m)||ply>=maxPly||s.killers[ply][0]==m{return};s.killers[ply][1]=s.killers[ply][0];s.killers[ply][0]=m }
+// nullWindow is the upper bound of a zero-width window just above alpha (values are floats of varying scale).
+func nullWindow(alpha float64) float64 { return alpha+1e-9*(1+math.Abs(alpha)) }
 
 // key extends the incremental board/pool hash with the remaining state that affects search results.
 func (p *Position) key() uint64 {
@@ -563,7 +595,14 @@ func (s *Searcher) negamax(p *Position,depth int,alpha,beta float64,ply int) flo
 	s.tick();if p.NoCapturePlies>=p.NoCaptureLimit{return 0};if p.Winner>=0{return s.terminalValue(p,ply)};if depth<=0{return s.qsearch(p,alpha,beta,ply,s.QDepth,s.QHiddenDepth)}
 	key:=p.key();entry,ok:=s.TT.get(key);ttBest,hasTT:=entry.Best,ok&&entry.HasBest;alpha0:=alpha;if ok&&entry.Depth>=depth{if entry.Flag==0{return entry.Value};if entry.Flag==1&&entry.Value>=beta{return entry.Value};if entry.Flag==2&&entry.Value<=alpha{return entry.Value}}
 	moves:=s.orderedMoves(p,ply,ttBest,hasTT);if len(moves)==0{return s.leafValue(p)};best:=-math.MaxFloat64;var bestMove Move;hasBest:=false
-	for _,m:=range moves{v:=s.child(p,m,depth,alpha,beta,ply);if v>best{best,bestMove,hasBest=v,m,true};if v>alpha{alpha=v};if alpha>=beta{break}}
+	for i,m:=range moves{
+		var v float64
+		if !s.Ext||i==0{v=s.child(p,m,depth,alpha,beta,ply)}else{
+			// Later moves: zero window first (reduced by one ply for late quiet moves), full re-search only if it beats alpha.
+			d:=depth;if !isTactical(m)&&depth>=s.LmrDepth&&i>=s.LmrMoves{d=depth-1}
+			v=s.child(p,m,d,alpha,nullWindow(alpha),ply);if v>alpha&&(d<depth||v<beta){v=s.child(p,m,depth,alpha,beta,ply)}
+		}
+		if v>best{best,bestMove,hasBest=v,m,true};if v>alpha{alpha=v};if alpha>=beta{if s.Ext{s.addKiller(m,ply)};break}}
 	flag:=uint8(0);if best<=alpha0{flag=2}else if best>=beta{flag=1};s.TT.put(key,TTEntry{Depth:depth,Value:best,Flag:flag,Best:bestMove,HasBest:hasBest});return best
 }
 func (s *Searcher) qsearch(p *Position,alpha,beta float64,ply,qdepth,hiddenLeft int)float64{
@@ -582,6 +621,14 @@ func safeRootWindow(search *Searcher,p Position,m Move,depth int,alpha,beta floa
 	defer func(){if r:=recover();r!=nil{if _,yes:=r.(timeoutPanic);yes{ok=false}else{panic(r)}}}()
 	value=search.child(&p,m,depth,alpha,beta,0);return value,true
 }
+// rootSearch searches one root move. With search extensions, moves after the first are tried with a zero
+// window above alpha and re-searched with an open window only when they beat it (a fail-low value is an upper
+// bound, which is enough to rank it below the best move).
+func rootSearch(search *Searcher,p Position,m Move,depth int,alpha float64,first bool)(float64,bool){
+	if first||!search.Ext||math.IsInf(alpha,-1){return safeRootWindow(search,p,m,depth,alpha,math.Inf(1))}
+	v,ok:=safeRootWindow(search,p,m,depth,alpha,nullWindow(alpha));if !ok||v<=alpha{return v,ok}
+	return safeRootWindow(search,p,m,depth,alpha,math.Inf(1))
+}
 func rootAction(m Move)map[string]any{if m.Kind==flipKind{return map[string]any{"type":"flip","row":m.A/cols,"col":m.A%cols}};kind:="move";if m.Kind==captureKind||m.Kind==hiddenCaptureKind{kind="capture"};return map[string]any{"type":kind,"from_row":m.A/cols,"from_col":m.A%cols,"to_row":m.C/cols,"to_col":m.C%cols}}
 
 // iterate runs iterative deepening over the root moves until the deadline, the stop flag or max_depth.
@@ -590,7 +637,7 @@ func (s *Searcher) iterate(p Position,ordered []Move,startDepth int)(best Move,b
 	for depth:=startDepth;depth<=s.MaxDepth;depth++{
 		if time.Now().After(s.Deadline)||s.Stop.Load(){timedOut=true;break}
 		vals:=make([]float64,len(ordered));alpha:=math.Inf(-1);complete:=true
-		for i,m:=range ordered{v,ok:=safeRootWindow(s,p,m,depth,alpha,math.Inf(1));if !ok{complete=false;break};vals[i]=v;if v>alpha{alpha=v}}
+		for i,m:=range ordered{v,ok:=rootSearch(s,p,m,depth,alpha,i==0);if !ok{complete=false;break};vals[i]=v;if v>alpha{alpha=v}}
 		if !complete{timedOut=true;break};idx:=0;for i:=1;i<len(vals);i++{if vals[i]>vals[idx]{idx=i}};best,bestValue,done=ordered[idx],vals[idx],depth;ordered=append([]Move{best},withoutMove(ordered,best)...);if s.OnDepth!=nil{s.OnDepth(best,bestValue,done)}
 	}
 	return
@@ -601,10 +648,10 @@ func (s *Searcher) iterate(p Position,ordered []Move,startDepth int)(best Move,b
 func iterateParallel(p Position,ordered []Move,workers []*Searcher)(best Move,bestValue float64,done int,timedOut bool){
 	main:=workers[0];best,bestValue=ordered[0],math.NaN()
 	for depth:=1;depth<=main.MaxDepth;depth++{
-		if time.Now().After(main.Deadline){timedOut=true;break}
+		if time.Now().After(main.Deadline)||main.Stop.Load(){timedOut=true;break}
 		vals:=make([]float64,len(ordered));first,ok:=safeRootWindow(main,p,ordered[0],depth,math.Inf(-1),math.Inf(1));if !ok{timedOut=true;break};vals[0]=first
 		var alphaBits atomic.Uint64;alphaBits.Store(math.Float64bits(first));var next atomic.Int64;next.Store(1);var failed atomic.Bool;var wg sync.WaitGroup
-		for _,w:=range workers{wg.Add(1);go func(w *Searcher){defer wg.Done();for{i:=int(next.Add(1)-1);if i>=len(ordered)||failed.Load(){return};alpha:=math.Float64frombits(alphaBits.Load());v,ok:=safeRootWindow(w,p,ordered[i],depth,alpha,math.Inf(1));if !ok{failed.Store(true);return};vals[i]=v
+		for _,w:=range workers{wg.Add(1);go func(w *Searcher){defer wg.Done();for{i:=int(next.Add(1)-1);if i>=len(ordered)||failed.Load(){return};alpha:=math.Float64frombits(alphaBits.Load());v,ok:=rootSearch(w,p,ordered[i],depth,alpha,false);if !ok{failed.Store(true);return};vals[i]=v
 			for{old:=alphaBits.Load();if v<=math.Float64frombits(old)||alphaBits.CompareAndSwap(old,math.Float64bits(v)){break}}}}(w)}
 		wg.Wait();if failed.Load(){timedOut=true;break}
 		idx:=0;for i:=1;i<len(vals);i++{if vals[i]>vals[idx]{idx=i}};best,bestValue,done=ordered[idx],vals[idx],depth;ordered=append([]Move{best},withoutMove(ordered,best)...);if main.OnDepth!=nil{main.OnDepth(best,bestValue,done)}
@@ -613,10 +660,22 @@ func iterateParallel(p Position,ordered []Move,workers []*Searcher)(best Move,be
 }
 // winProb converts a search value back to the estimated win probability (as the Python searcher reports).
 func (s *Searcher) winProb(p *Position,value float64) float64 {v:=value/math.Pow(s.estMultiplier(p),s.Lam);if v<0{v/=s.Kappa};return math.Max(0,math.Min(1,(v+1)/2))}
-func choose(p Position,req Request,emit func(any))(map[string]any,map[string]any){
+// Transposition tables kept across requests (the engine is a long-lived process): one per strategy + parameter
+// set, so two players with different settings in one process do not share or clear each other's entries.
+// The table key covers the full game state (see Position.key), so entries from earlier moves stay valid.
+type keptTable struct { key string; tt *TransTable }
+var keptTables []keptTable
+func tableFor(req Request,strategy int) *TransTable {
+	params:=defaultParams();for k,v:=range req.Params{params[k]=v};if intParam(params,"keep_tt",1)==0{return nil}
+	raw,_:=json.Marshal(params);key:=fmt.Sprint(strategy)+string(raw)
+	for i,t:=range keptTables{if t.key==key{keptTables=append(append([]keptTable{t},keptTables[:i]...),keptTables[i+1:]...);return t.tt}}
+	t:=keptTable{key,newTransTable(intParam(params,"tt_bits",21))};keptTables=append([]keptTable{t},keptTables...);if len(keptTables)>3{keptTables=keptTables[:3]};return t.tt
+}
+func choose(p Position,req Request,emit func(any),stop *atomic.Bool)(map[string]any,map[string]any){
 	if p.NoCapturePlies >= p.NoCaptureLimit { return nil, map[string]any{"source":"rules","draw":true,"no_capture_plies":p.NoCapturePlies} }
 	strategy:=16;if strings.Contains(req.Strategy,"17"){strategy=17};threads:=req.Threads;if threads<1{threads=1};if threads>runtime.NumCPU(){threads=runtime.NumCPU()};budget:=req.TimeBudgetMS;if budget<1{budget=1};deadline:=time.Now().Add(time.Duration(budget)*time.Millisecond)
-	mainSearcher:=makeSearcher(req.Params,strategy,deadline,nil,nil)
+	tt:=tableFor(req,strategy);if tt!=nil{tt.nextGeneration()}
+	mainSearcher:=makeSearcher(req.Params,strategy,deadline,tt,stop)
 	// The deadline also raises the stop flag from a timer, in addition to the clock checks in tick().
 	stopTimer:=time.AfterFunc(time.Until(deadline),func(){mainSearcher.Stop.Store(true)});defer stopTimer.Stop()
 	if req.Progress&&emit!=nil{mainSearcher.OnDepth=func(m Move,v float64,d int){emit(map[string]any{"progress":map[string]any{"action":rootAction(m),"info":map[string]any{"source":"search","depth":d,"score":v,"win_prob":mainSearcher.winProb(&p,v),"multiplier":p.multiplier(),"partial":true}}})}}
@@ -630,12 +689,37 @@ func choose(p Position,req Request,emit func(any))(map[string]any,map[string]any
 }
 func withoutMove(moves []Move,best Move)[]Move{out:=make([]Move,0,len(moves)-1);skipped:=false;for _,m:=range moves{if !skipped&&m==best{skipped=true;continue};out=append(out,m)};return out}
 
-func handle(req Request,emit func(any)) Response {
+func handle(req Request,emit func(any),stop *atomic.Bool) Response {
 	if req.Strategy!="StrategicV16AI"&&req.Strategy!="StrategicV17AI"{return Response{Error:"unsupported strategy; choose StrategicV16AI or StrategicV17AI"}}
 	p,err:=parsePosition(req.State);if err!=nil{return Response{Error:err.Error()}}
-	action,info:=choose(p,req,emit);return Response{Action:action,Info:info}
+	action,info:=choose(p,req,emit,stop);return Response{Action:action,Info:info}
 }
-func main(){scanner:=bufio.NewScanner(os.Stdin);scanner.Buffer(make([]byte,4096),8*1024*1024);writer:=bufio.NewWriter(os.Stdout);defer writer.Flush();for scanner.Scan(){var req Request;if err:=json.Unmarshal(scanner.Bytes(),&req);err!=nil{_ = json.NewEncoder(writer).Encode(Response{Error:err.Error()});writer.Flush();continue};emit:=func(v any){_ = json.NewEncoder(writer).Encode(v);writer.Flush()}
-		// Safety net: if a request overruns its budget by 3s, report every goroutine stack and exit instead of hanging.
-		watchdog:=time.AfterFunc(time.Duration(max(1,req.TimeBudgetMS)+3000)*time.Millisecond,func(){buf:=make([]byte,1<<20);n:=runtime.Stack(buf,true);fmt.Fprintf(os.Stderr,"engine watchdog: search exceeded its time budget by 3s\n%s",buf[:n]);os.Exit(3)})
-		resp:=handle(req,emit);watchdog.Stop();_ = json.NewEncoder(writer).Encode(resp);writer.Flush()}}
+// main serves requests, one JSON object per line, until stdin closes. The process stays alive between
+// requests so the transposition tables carry over (the next move's position is usually already searched).
+// A {"cmd":"stop"} line interrupts the running search; requests arriving meanwhile wait their turn.
+func main(){
+	lines:=make(chan []byte)
+	go func(){scanner:=bufio.NewScanner(os.Stdin);scanner.Buffer(make([]byte,4096),8*1024*1024);for scanner.Scan(){lines<-append([]byte(nil),scanner.Bytes()...)};close(lines)}()
+	writer:=bufio.NewWriter(os.Stdout);var mu sync.Mutex
+	emit:=func(v any){mu.Lock();defer mu.Unlock();_ = json.NewEncoder(writer).Encode(v);writer.Flush()}
+	var queue []Request;var running *atomic.Bool;done:=make(chan struct{})
+	start:=func(req Request){
+		stop:=&atomic.Bool{};running=stop
+		go func(){
+			// Safety net: if a request overruns its budget by 3s, report every goroutine stack and exit instead of hanging.
+			watchdog:=time.AfterFunc(time.Duration(max(1,req.TimeBudgetMS)+3000)*time.Millisecond,func(){buf:=make([]byte,1<<20);n:=runtime.Stack(buf,true);fmt.Fprintf(os.Stderr,"engine watchdog: search exceeded its time budget by 3s\n%s",buf[:n]);os.Exit(3)})
+			resp:=handle(req,emit,stop);watchdog.Stop();emit(resp);done<-struct{}{}
+		}()
+	}
+	for lines!=nil||running!=nil{
+		select{
+		case line,ok:=<-lines:
+			if !ok{lines=nil;continue}
+			var req Request;if err:=json.Unmarshal(line,&req);err!=nil{emit(Response{Error:err.Error()});continue}
+			if req.Cmd=="stop"{if running!=nil{running.Store(true)};continue}
+			if running==nil{start(req)}else{queue=append(queue,req)}
+		case <-done:
+			running=nil;if len(queue)>0{req:=queue[0];queue=queue[1:];start(req)}
+		}
+	}
+}

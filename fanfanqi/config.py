@@ -35,6 +35,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 提示方：'both' | 'red' | 'black' | 'off'。人机对战中只会提示玩家一方
     'hint_side': 'both',
     'show_hint_on_board': True,
+    # 不需要提示的一方（如画面同步时的对方）思考时，用 Go 引擎在后台提前计算（最多这么多秒），
+    # 结果留在引擎的置换表里。实测收益很小（还有暗子时，根节点翻子按真实结果展开，深处是近似的，
+    # 提前算的局面大多用不上），却要在对方思考时占用 CPU，所以默认关闭
+    'ponder': False,
+    'ponder_time_sec': 30,
     # 人机对战中电脑算完后再停顿多久落子（毫秒），便于看清
     'ai_move_delay_ms': 400,
     # StrategicV15AI 搜索参数（高级）。数值越大越强也越慢；含义见 README

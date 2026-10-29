@@ -1,7 +1,8 @@
 """翻翻棋 tkinter 界面。
 
 两种模式：
-- 录入+提示：录入实物对局的每一步（翻出什么由人选择），AI 只给提示。
+- 录入+提示：录入实物对局的每一步（翻出什么由人选择），AI 只给提示；
+  也可以打开「画面同步」，从屏幕上的对局画面自动同步每一步（见 sync.py），只给自己一方提示。
 - 人机对战：翻子随机，电脑自动走子；可选让 AI 给玩家提示。
 """
 
@@ -21,9 +22,30 @@ from .game import (
 )
 from .state import captured_pieces, game_from_state, game_to_state, lost_hp
 
+# 棋盘尺寸在启动时按屏幕大小计算（set_board_size），下面是上限
 CELL = 72
 MARGIN = 28
 PIECE_R = 29
+PIECE_FONT = 20
+# 棋盘两侧的被吃子栏（参照游戏画面）：左栏自己、右栏对方；被吃过的亮、没被吃的淡，2 个以上有数量角标
+SIDE_COL_W = 52
+ICON_R = 17
+ICON_STEP = 44
+ICON_FONT = 12
+
+
+def set_board_size(cell):
+    """按格子边长设置棋盘、棋子、两侧被吃子栏的尺寸（比例同 72 像素的原始设计）。"""
+    global CELL, MARGIN, PIECE_R, PIECE_FONT, SIDE_COL_W, ICON_R, ICON_STEP, ICON_FONT
+    CELL = cell
+    MARGIN = round(cell * 0.39)
+    PIECE_R = round(cell * 0.40)
+    PIECE_FONT = max(10, round(cell * 0.28))
+    SIDE_COL_W = round(cell * 0.72)
+    ICON_R = round(cell * 0.24)
+    ICON_STEP = round(cell * 0.61)
+    ICON_FONT = max(8, round(cell * 0.17))
+CAPTURE_COLUMNS = (('left', '将仕象车马炮兵', 1.57), ('right', '兵炮马车象仕将', 2.79))  # 栏、从上到下的顺序、首个图标所在行
 
 COLORS = {
     'board_bg': '#e8c98f',
@@ -100,6 +122,12 @@ class App:
         self.ai_token = 0
         self.ai_queue = queue.Queue()
         self.ai_busy = False  # 电脑正在思考/准备落子
+        self.pondering = False  # 对方回合在后台提前计算（见 can_ponder）
+        # 画面同步（录入模式）：后台线程截屏识别，结果经队列交给界面线程
+        self.sync_watcher = None
+        self.board_sync = None
+        self.sync_synced = False
+        self.sync_queue = queue.Queue()
 
         cfg = self.config
         self.mode_var = tk.StringVar(value=MODE_LABELS.get(cfg['mode'], MODE_LABELS['record']))
@@ -115,8 +143,10 @@ class App:
         self.hint_depth_var = tk.IntVar(value=max(0, int(cfg['hint_min_depth'])))
         self.hint_side_var = tk.StringVar(value=HINT_SIDE_LABELS.get(cfg['hint_side'], '双方'))
         self.show_on_board_var = tk.BooleanVar(value=cfg['show_hint_on_board'])
+        self.ponder_var = tk.BooleanVar(value=cfg['ponder'])
 
         self._build_ui()
+        self.fit_to_screen()
         self.new_game()
         self.root.after(100, self._poll_ai_queue)
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
@@ -157,12 +187,29 @@ class App:
         except (tk.TclError, ValueError):
             return self.config['hint_min_depth']
 
+    @property
+    def syncing(self):
+        return self.sync_watcher is not None
+
+    def sync_side(self):
+        """画面同步时自己（画面下方玩家）执哪一方；还认不出时为 None。"""
+        return self.board_sync.my_side if self.syncing else None
+
     def hint_sides(self):
         sides = HINT_SIDE_VALUES[_key_of(HINT_SIDE_LABELS, self.hint_side_var.get())]
+        if self.syncing:
+            # 画面同步只为自己一方提示（「关闭」时不提示）
+            mine = self.sync_side()
+            return (mine,) if mine and sides else ()
         if self.is_vs():
             # 人机对战中电脑一方直接走子，只为玩家提示
             return tuple(s for s in sides if s == self.player_side)
         return sides
+
+    def can_ponder(self):
+        """不需要提示的一方行动时是否后台提前计算：只用 Go 引擎（常驻进程保留置换表），人机对战中不做。"""
+        return (self.config.get('ponder') and not self.is_vs() and bool(self.hint_sides())
+                and self.engine_var.get() == 'Go' and self.model_var.get() in ('StrategicV16AI', 'StrategicV17AI'))
 
     def save_settings(self):
         cfg = self.config
@@ -189,6 +236,7 @@ class App:
         cfg['hint_min_depth'] = self.hint_min_depth()
         cfg['hint_side'] = _key_of(HINT_SIDE_LABELS, self.hint_side_var.get())
         cfg['show_hint_on_board'] = bool(self.show_on_board_var.get())
+        cfg['ponder'] = bool(self.ponder_var.get())
         save_config(cfg)
 
     def on_setting_changed(self, _event=None):
@@ -231,179 +279,228 @@ class App:
         self.new_game()
 
     def on_close(self):
+        self.stop_sync()
         self.save_settings()
         self.root.destroy()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         style = ttk.Style()
-        style.configure('Hint.TLabel', font=('Microsoft YaHei UI', 13, 'bold'), foreground='#b35900')
+        style.configure('Hint.TLabel', font=('Microsoft YaHei UI', 12, 'bold'), foreground='#b35900')
 
-        outer = ttk.Frame(self.root, padding=10)
+        outer = ttk.Frame(self.root, padding=6)
         outer.pack(fill='both', expand=True)
 
         left = ttk.Frame(outer)
         left.pack(side='left', fill='y')
-        right = ttk.Frame(outer, padding=(12, 0, 0, 0))
+        right = ttk.Frame(outer, padding=(8, 0, 0, 0))
         right.pack(side='left', fill='both', expand=True)
+        self.left_panel, self.right_panel = left, right
 
-        self.hp_canvas = tk.Canvas(left, width=COLS * CELL + 2 * MARGIN, height=48, highlightthickness=0)
+        self.hp_canvas = tk.Canvas(left, width=COLS * CELL + 2 * MARGIN + 2 * SIDE_COL_W, height=48,
+                                   highlightthickness=0)
         self.hp_canvas.pack()
 
         w = COLS * CELL + 2 * MARGIN
         h = ROWS * CELL + 2 * MARGIN
-        self.canvas = tk.Canvas(left, width=w, height=h, bg=COLORS['board_bg'], highlightthickness=0)
-        self.canvas.pack()
+        board_row = ttk.Frame(left)
+        board_row.pack()
+        self.capture_canvases = {}
+        for name in ('left', 'board', 'right'):
+            if name == 'board':
+                self.canvas = tk.Canvas(board_row, width=w, height=h, bg=COLORS['board_bg'], highlightthickness=0)
+                self.canvas.pack(side='left')
+            else:
+                canvas = tk.Canvas(board_row, width=SIDE_COL_W, height=h, highlightthickness=0)
+                canvas.pack(side='left')
+                self.capture_canvases[name] = canvas
         self.canvas.bind('<Button-1>', self.on_click)
 
         self.status_var = tk.StringVar()
-        ttk.Label(left, textvariable=self.status_var, font=('Microsoft YaHei UI', 12, 'bold')).pack(pady=(8, 0))
+        ttk.Label(left, textvariable=self.status_var, font=('Microsoft YaHei UI', 11, 'bold')).pack(pady=(4, 0))
         self.last_move_var = tk.StringVar()
         ttk.Label(left, textvariable=self.last_move_var, foreground='#666666').pack()
 
         btns = ttk.Frame(left)
-        btns.pack(pady=4)
+        btns.pack(pady=(2, 0))
         ttk.Button(btns, text='悔棋', command=self.undo).pack(side='left', padx=3)
         ttk.Button(btns, text='新对局', command=self.restart).pack(side='left', padx=3)
-        ttk.Button(btns, text='保存棋谱', command=self.save_log).pack(side='left', padx=3)
-        btns2 = ttk.Frame(left)
-        btns2.pack()
-        ttk.Button(btns2, text='导出局面', command=self.export_state).pack(side='left', padx=3)
-        ttk.Button(btns2, text='导入局面', command=self.import_state).pack(side='left', padx=3)
+
+        # 右侧：提示 / 设置 / 棋谱 三个标签页；宽度固定为棋盘区的一半（fit_to_screen 设置）
+        right.pack_propagate(False)
+        self.wrap_labels = []  # 随右侧宽度换行的标签
+
+        def wrapped(parent, **kw):
+            label = ttk.Label(parent, justify='left', **kw)
+            self.wrap_labels.append(label)
+            return label
+
+        self.tabs = tabs = ttk.Notebook(right)
+        tabs.pack(fill='both', expand=True)
+        main_tab = ttk.Frame(tabs, padding=4)
+        cfg_tab = ttk.Frame(tabs, padding=4)
+        log_tab = ttk.Frame(tabs, padding=4)
+        tabs.add(main_tab, text='提示')
+        tabs.add(cfg_tab, text='设置')
+        tabs.add(log_tab, text='棋谱')
+
+        # 画面同步
+        sync_box = ttk.LabelFrame(main_tab, text='画面同步', padding=4)
+        sync_box.pack(fill='x', pady=(0, 4))
+        self.sync_btn = ttk.Button(sync_box, text='开始同步', command=self.toggle_sync)
+        self.sync_btn.pack(anchor='w')
+        self.sync_status_var = tk.StringVar(value='从屏幕上的对局画面自动同步每一步（录入+提示模式；游戏窗口需可见）')
+        wrapped(sync_box, textvariable=self.sync_status_var, foreground='#666666').pack(anchor='w', pady=(4, 0))
 
         # AI 提示
-        hint_box = ttk.LabelFrame(right, text='AI 提示', padding=8)
+        hint_box = ttk.LabelFrame(main_tab, text='AI 提示', padding=4)
         hint_box.pack(fill='x')
         self.hint_title_var = tk.StringVar()
         self.hint_text_var = tk.StringVar()
         self.hint_meta_var = tk.StringVar()
-        ttk.Label(hint_box, textvariable=self.hint_title_var).pack(anchor='w')
-        ttk.Label(hint_box, textvariable=self.hint_text_var, style='Hint.TLabel', wraplength=300).pack(anchor='w', pady=4)
-        ttk.Label(hint_box, textvariable=self.hint_meta_var, foreground='#666666', wraplength=300).pack(anchor='w')
+        wrapped(hint_box, textvariable=self.hint_title_var).pack(anchor='w')
+        wrapped(hint_box, textvariable=self.hint_text_var, style='Hint.TLabel').pack(anchor='w', pady=4)
+        wrapped(hint_box, textvariable=self.hint_meta_var, foreground='#666666').pack(anchor='w')
         hb = ttk.Frame(hint_box)
-        hb.pack(anchor='w', pady=(6, 0))
-        self.follow_btn = ttk.Button(hb, text='按提示走', command=self.follow_hint)
+        hb.pack(anchor='w', pady=(4, 0))
+        self.follow_btn = ttk.Button(hb, text='按提示走', width=8, command=self.follow_hint)
         self.follow_btn.pack(side='left')
-        ttk.Button(hb, text='重新计算', command=self.request_ai).pack(side='left', padx=6)
+        ttk.Button(hb, text='重新计算', width=8, command=self.request_ai).pack(side='left', padx=4)
 
-        # 设置
-        cfg = ttk.LabelFrame(right, text='设置（自动保存到 config.json）', padding=8)
-        cfg.pack(fill='x', pady=8)
-        row = 0
-        ttk.Label(cfg, text='模式').grid(row=row, column=0, sticky='w')
-        mode_box = ttk.Combobox(cfg, textvariable=self.mode_var, values=list(MODE_LABELS.values()),
-                                state='readonly', width=10)
-        mode_box.grid(row=row, column=1, sticky='w', pady=2)
-        mode_box.bind('<<ComboboxSelected>>', self.on_mode_changed)
-        row += 1
-        self.player_side_label = ttk.Label(cfg, text='我执')
-        self.player_side_label.grid(row=row, column=0, sticky='w')
-        self.player_side_box = ttk.Combobox(cfg, textvariable=self.player_side_var,
-                                            values=[SIDE_NAMES['red'], SIDE_NAMES['black']], state='readonly', width=10)
-        self.player_side_box.grid(row=row, column=1, sticky='w', pady=2)
-        self.player_side_box.bind('<<ComboboxSelected>>', self.on_mode_changed)
-        row += 1
-        ttk.Label(cfg, text='策略版本 / 模型').grid(row=row, column=0, sticky='w')
-        self.model_box = ttk.Combobox(cfg, textvariable=self.model_var, values=AI_MODELS, state='readonly', width=18)
-        self.model_box.grid(row=row, column=1, sticky='w', pady=2)
-        self.model_box.bind('<<ComboboxSelected>>', self.on_setting_changed)
-        row += 1
-        ttk.Label(cfg, text='计算引擎').grid(row=row, column=0, sticky='w')
-        self.engine_box = ttk.Combobox(cfg, textvariable=self.engine_var, values=['Python', 'Go'],
-                                       state='readonly', width=10)
-        self.engine_box.grid(row=row, column=1, sticky='w', pady=2)
-        self.engine_box.bind('<<ComboboxSelected>>', self.on_engine_changed)
-        row += 1
-        ttk.Label(cfg, text='Go 线程数').grid(row=row, column=0, sticky='w')
-        self.threads_spin = ttk.Spinbox(cfg, from_=1, to=64, increment=1, textvariable=self.threads_var,
-                                        width=8, command=self.on_setting_changed)
-        self.threads_spin.grid(row=row, column=1, sticky='w', pady=2)
-        self.threads_spin.bind('<FocusOut>', lambda _e: self.on_setting_changed())
-        row += 1
-        ttk.Label(cfg, text='长捉上限').grid(row=row, column=0, sticky='w')
-        chase_spin = ttk.Spinbox(cfg, from_=2, to=20, increment=1, textvariable=self.long_chase_var,
-                                 width=8, command=self.on_rule_setting_changed)
-        chase_spin.grid(row=row, column=1, sticky='w', pady=2)
-        chase_spin.bind('<FocusOut>', self.on_rule_setting_changed)
-        row += 1
-        ttk.Label(cfg, text='未吃子和棋步数').grid(row=row, column=0, sticky='w')
-        no_capture_spin = ttk.Spinbox(cfg, from_=1, to=100, increment=1, textvariable=self.no_capture_var,
-                                      width=8, command=self.on_rule_setting_changed)
-        no_capture_spin.grid(row=row, column=1, sticky='w', pady=2)
-        no_capture_spin.bind('<FocusOut>', self.on_rule_setting_changed)
-        row += 1
-        ttk.Label(cfg, text='提示思考时间(秒)').grid(row=row, column=0, sticky='w')
-        spin = ttk.Spinbox(cfg, from_=0.3, to=30, increment=0.5, textvariable=self.budget_var, width=8,
-                           command=self.save_settings)
-        spin.grid(row=row, column=1, sticky='w', pady=2)
-        spin.bind('<FocusOut>', lambda _e: self.save_settings())
-        row += 1
-        ttk.Label(cfg, text='提示起始层数').grid(row=row, column=0, sticky='w')
-        depth_spin = ttk.Spinbox(cfg, from_=0, to=20, increment=1, textvariable=self.hint_depth_var, width=8,
-                                 command=self.save_settings)
-        depth_spin.grid(row=row, column=1, sticky='w', pady=2)
-        depth_spin.bind('<FocusOut>', lambda _e: self.save_settings())
-        row += 1
-        ttk.Label(cfg, text='电脑思考时间(秒)').grid(row=row, column=0, sticky='w')
-        self.ai_budget_spin = ttk.Spinbox(cfg, from_=0.3, to=30, increment=0.5, textvariable=self.ai_budget_var,
-                                          width=8, command=self.save_settings)
-        self.ai_budget_spin.grid(row=row, column=1, sticky='w', pady=2)
-        self.ai_budget_spin.bind('<FocusOut>', lambda _e: self.save_settings())
-        row += 1
-        ttk.Label(cfg, text='提示方').grid(row=row, column=0, sticky='w')
-        side_box = ttk.Combobox(cfg, textvariable=self.hint_side_var, values=list(HINT_SIDE_LABELS.values()),
-                                state='readonly', width=8)
-        side_box.grid(row=row, column=1, sticky='w', pady=2)
-        side_box.bind('<<ComboboxSelected>>', self.on_setting_changed)
-        row += 1
-        ttk.Checkbutton(cfg, text='在棋盘上标出提示', variable=self.show_on_board_var,
-                        command=lambda: (self.save_settings(), self.draw_board())).grid(
-            row=row, column=0, columnspan=2, sticky='w')
-        row += 1
-        ttk.Label(cfg, text='思考时间对 V15、V16、V17（迭代加深）生效；\n'
-                            'V16/V17 搜到起始层数即先给提示，之后随深度更新（0 = 只给最终结果）；\n'
-                            '电脑思考时间只用于人机对战；人机对战中提示只针对玩家一方',
-                  foreground='#888888').grid(row=row, column=0, columnspan=2, sticky='w')
-        self.update_engine_widgets()
-
-        mult_box = ttk.LabelFrame(right, text='倍率', padding=8)
-        mult_box.pack(fill='x', pady=(0, 8))
+        mult_box = ttk.LabelFrame(main_tab, text='倍率（参考）', padding=4)
+        mult_box.pack(fill='x', pady=(4, 0))
         self.mult_var = tk.StringVar()
         self.combo_var = tk.StringVar()
-        ttk.Label(mult_box, textvariable=self.mult_var, font=('Microsoft YaHei UI', 11, 'bold')).pack(anchor='w')
-        ttk.Label(mult_box, textvariable=self.combo_var, foreground='#666666').pack(anchor='w')
+        wrapped(mult_box, textvariable=self.mult_var, font=('Microsoft YaHei UI', 10, 'bold')).pack(anchor='w')
+        wrapped(mult_box, textvariable=self.combo_var, foreground='#666666').pack(anchor='w')
 
-        captured_box = ttk.LabelFrame(right, text='被吃掉的棋子', padding=8)
-        captured_box.pack(fill='x', pady=(0, 8))
-        self.captured_labels = {}
-        for side in ('red', 'black'):
-            lbl = ttk.Label(captured_box, font=('Microsoft YaHei UI', 11), foreground=COLORS[side])
-            lbl.pack(anchor='w')
-            self.captured_labels[side] = lbl
-
-        pool_box = ttk.LabelFrame(right, text='剩余棋子池（暗子）', padding=8)
-        pool_box.pack(fill='x')
+        pool_box = ttk.LabelFrame(main_tab, text='剩余棋子池（暗子）', padding=4)
+        pool_box.pack(fill='x', pady=(4, 0))
         self.pool_var = tk.StringVar()
-        ttk.Label(pool_box, textvariable=self.pool_var, font=('Microsoft YaHei UI', 11), justify='left').pack(anchor='w')
+        wrapped(pool_box, textvariable=self.pool_var).pack(anchor='w')
 
-        log_box = ttk.LabelFrame(right, text='棋谱', padding=8)
-        log_box.pack(fill='both', expand=True, pady=(8, 0))
-        self.log_list = tk.Listbox(log_box, height=10, font=('Microsoft YaHei UI', 10))
-        self.log_list.pack(side='left', fill='both', expand=True)
-        sb = ttk.Scrollbar(log_box, command=self.log_list.yview)
+        # 设置：标签尽量短；选项文字较长的（模式、模型）单独一行
+        cfg = ttk.Frame(cfg_tab)
+        cfg.pack(fill='x')
+        cfg.columnconfigure(1, weight=1)
+        row = 0
+
+        def setting(label, widget, wide=False):
+            nonlocal row
+            lbl = ttk.Label(cfg, text=label)
+            if wide:
+                lbl.grid(row=row, column=0, columnspan=2, sticky='w')
+                widget.grid(row=row + 1, column=0, columnspan=2, sticky='we', pady=(0, 2))
+                row += 2
+            else:
+                lbl.grid(row=row, column=0, sticky='w', padx=(0, 4))
+                widget.grid(row=row, column=1, sticky='w', pady=1)
+                row += 1
+            return lbl
+
+        def spinbox(var, lo, hi, step, command, bind=None):
+            box = ttk.Spinbox(cfg, from_=lo, to=hi, increment=step, textvariable=var, width=4, command=command)
+            box.bind('<FocusOut>', bind or (lambda _e: command()))
+            return box
+
+        mode_box = ttk.Combobox(cfg, textvariable=self.mode_var, values=list(MODE_LABELS.values()),
+                                state='readonly', width=10)
+        mode_box.bind('<<ComboboxSelected>>', self.on_mode_changed)
+        setting('模式', mode_box, wide=True)
+        self.player_side_box = ttk.Combobox(cfg, textvariable=self.player_side_var,
+                                            values=[SIDE_NAMES['red'], SIDE_NAMES['black']], state='readonly', width=5)
+        self.player_side_box.bind('<<ComboboxSelected>>', self.on_mode_changed)
+        self.player_side_label = setting('我执', self.player_side_box)
+        self.model_box = ttk.Combobox(cfg, textvariable=self.model_var, values=AI_MODELS, state='readonly', width=16)
+        self.model_box.bind('<<ComboboxSelected>>', self.on_setting_changed)
+        setting('策略版本 / 模型', self.model_box, wide=True)
+        self.engine_box = ttk.Combobox(cfg, textvariable=self.engine_var, values=['Python', 'Go'],
+                                       state='readonly', width=6)
+        self.engine_box.bind('<<ComboboxSelected>>', self.on_engine_changed)
+        setting('计算引擎', self.engine_box)
+        self.threads_spin = spinbox(self.threads_var, 1, 64, 1, self.on_setting_changed)
+        setting('Go 线程', self.threads_spin)
+        setting('长捉上限', spinbox(self.long_chase_var, 2, 20, 1, self.on_rule_setting_changed,
+                                  self.on_rule_setting_changed))
+        setting('和棋步数', spinbox(self.no_capture_var, 1, 100, 1, self.on_rule_setting_changed,
+                                  self.on_rule_setting_changed))
+        setting('提示时间(秒)', spinbox(self.budget_var, 0.3, 30, 0.5, self.save_settings))
+        setting('起始层数', spinbox(self.hint_depth_var, 0, 20, 1, self.save_settings))
+        self.ai_budget_spin = spinbox(self.ai_budget_var, 0.3, 30, 0.5, self.save_settings)
+        setting('电脑时间(秒)', self.ai_budget_spin)
+        side_box = ttk.Combobox(cfg, textvariable=self.hint_side_var, values=list(HINT_SIDE_LABELS.values()),
+                                state='readonly', width=5)
+        side_box.bind('<<ComboboxSelected>>', self.on_setting_changed)
+        setting('提示方', side_box)
+        ttk.Checkbutton(cfg, text='在棋盘上标出提示', variable=self.show_on_board_var,
+                        command=lambda: (self.save_settings(), self.draw_board())).grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        row += 1
+        ttk.Checkbutton(cfg, text='对方回合提前计算（Go）', variable=self.ponder_var,
+                        command=self.on_setting_changed).grid(row=row, column=0, columnspan=2, sticky='w')
+        wrapped(cfg_tab, text='自动保存到 config.json。提示时间：给提示的思考时间；起始层数：V16/V17 搜到这一层就先给提示，'
+                              '之后随深度更新（0 = 只给最终结果）；和棋步数：连续未吃子的普通移子数；'
+                              '电脑时间只用于人机对战。思考时间对 V15~V17 生效。'
+                              '提前计算：不需要提示的一方行动时，Go 引擎在后台先算，轮到自己时提示更快更深。',
+                foreground='#888888').pack(anchor='w', pady=(6, 0))
+        self.update_engine_widgets()
+
+        # 棋谱
+        log_btns = ttk.Frame(log_tab)
+        log_btns.pack(fill='x', pady=(0, 4))
+        ttk.Button(log_btns, text='保存棋谱', width=8, command=self.save_log).grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(log_btns, text='导出局面', width=8, command=self.export_state).grid(row=0, column=1)
+        ttk.Button(log_btns, text='导入局面', width=8, command=self.import_state).grid(row=1, column=0, padx=(0, 4),
+                                                                                    pady=(4, 0))
+        log_box = ttk.Frame(log_tab)
+        log_box.pack(fill='both', expand=True)
+        # 用自动换行的文本框，窄面板里长着法也能看全
+        self.log_text = tk.Text(log_box, height=10, width=10, wrap='char', font=('Microsoft YaHei UI', 9),
+                                relief='flat', state='disabled')
+        self.log_text.pack(side='left', fill='both', expand=True)
+        sb = ttk.Scrollbar(log_box, command=self.log_text.yview)
         sb.pack(side='right', fill='y')
-        self.log_list.config(yscrollcommand=sb.set)
+        self.log_text.config(yscrollcommand=sb.set)
 
         rules = ('规则：4列×8行；将>仕>象>车>马>炮，兵可吃将、将不能吃兵；'
                  '炮隔一子跳吃（可打暗子），不能空走；每步翻一子或走一格；'
                  'HP 将30 仕10 象/车/马/炮5 兵2，双方各60，先扣完者负。')
-        ttk.Label(right, text=rules, foreground='#666666', wraplength=320, justify='left').pack(anchor='w', pady=(8, 0))
+        wrapped(log_tab, text=rules, foreground='#666666').pack(anchor='w', pady=(4, 0))
         self.update_mode_widgets()
+
+    def fit_to_screen(self):
+        """按屏幕大小定尺寸：棋盘区（棋盘 + 两侧被吃子栏）与右侧面板宽度约 2:1，窗口总宽不超过屏幕的 42%、
+        高度不超过屏幕（扣除任务栏和标题栏），然后摆到屏幕右上角。"""
+        root = self.root
+        root.update_idletasks()
+        screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        board_h = ROWS * CELL + 2 * MARGIN
+        other_h = self.left_panel.winfo_reqheight() - board_h + 12  # 血量条、状态行、按钮
+        width_per_cell = COLS + 2 * 0.39 + 2 * 0.72  # 棋盘区宽度 / 格子边长
+        by_w = (screen_w * 0.42 - 30) / 1.5 / width_per_cell
+        by_h = (screen_h - 90 - other_h) / (ROWS + 2 * 0.39)
+        set_board_size(max(40, min(72, int(min(by_w, by_h)))))
+        w, h = COLS * CELL + 2 * MARGIN, ROWS * CELL + 2 * MARGIN
+        self.canvas.configure(width=w, height=h)
+        for canvas in self.capture_canvases.values():
+            canvas.configure(width=SIDE_COL_W, height=h)
+        board_w = w + 2 * SIDE_COL_W
+        self.hp_canvas.configure(width=board_w)
+        panel_w = board_w // 2
+        self.right_panel.configure(width=panel_w)
+        for label in self.wrap_labels:
+            label.configure(wraplength=panel_w - 34)
+        root.update_idletasks()
+        x = max(0, screen_w - root.winfo_reqwidth() - 16)
+        root.geometry(f'+{x}+0')
 
     def update_mode_widgets(self):
         state = 'readonly' if self.is_vs() else 'disabled'
         self.player_side_box.configure(state=state)
         self.ai_budget_spin.configure(state='normal' if self.is_vs() else 'disabled')
+        if self.is_vs():
+            self.stop_sync()
+        self.sync_btn.state(['disabled'] if self.is_vs() else ['!disabled'])
 
     # -------------------------------------------------------------- drawing
     def cell_rect(self, row, col):
@@ -469,13 +566,14 @@ class App:
         if not piece['face_up']:
             c.create_oval(x - PIECE_R, y - PIECE_R, x + PIECE_R, y + PIECE_R,
                           fill=COLORS['hidden'], outline='#4a3418', width=2)
-            c.create_text(x, y, text='?', fill=COLORS['hidden_text'], font=('Microsoft YaHei UI', 16, 'bold'))
+            c.create_text(x, y, text='?', fill=COLORS['hidden_text'],
+                          font=('Microsoft YaHei UI', max(9, PIECE_FONT * 4 // 5), 'bold'))
             return
         color = COLORS[piece['side']]
         c.create_oval(x - PIECE_R, y - PIECE_R, x + PIECE_R, y + PIECE_R, fill=COLORS['face'], outline=color, width=3)
         c.create_oval(x - PIECE_R + 5, y - PIECE_R + 5, x + PIECE_R - 5, y + PIECE_R - 5, outline=color, width=1)
         c.create_text(x, y, text=PIECE_NAMES[piece['side']][piece['type']], fill=color,
-                      font=('Microsoft YaHei UI', 20, 'bold'))
+                      font=('Microsoft YaHei UI', PIECE_FONT, 'bold'))
 
     def draw_hint(self, action):
         c = self.canvas
@@ -489,21 +587,66 @@ class App:
         c.create_rectangle(x0 + 3, y0 + 3, x1 - 3, y1 - 3, outline=COLORS['hint'], width=4, dash=(6, 3))
         c.create_line(fx, fy, tx, ty, fill=COLORS['hint'], width=5, arrow='last', arrowshape=(16, 20, 7))
 
+    def bottom_side(self):
+        """画面下方（自己）一方：画面同步时是识别出的执子方，人机对战是玩家一方，录入模式默认红方。"""
+        return self.sync_side() or (self.player_side if self.is_vs() else 'red')
+
+    def draw_captured(self):
+        """棋盘两侧的被吃子栏：左栏自己被吃的子，右栏对方的。"""
+        g = self.game
+        captured = captured_pieces(g)
+        mine = self.bottom_side()
+        la = g.last_action
+        latest = (la['defender']['side'], la['defender']['type']) if la and la['type'] == 'capture' else None
+        for name, order, first_row in CAPTURE_COLUMNS:
+            side = mine if name == 'left' else other_side(mine)
+            c = self.capture_canvases[name]
+            c.delete('all')
+            x = SIDE_COL_W / 2
+            y0 = MARGIN + first_row * CELL
+            c.create_text(x, y0 - ICON_R - 14, text=SIDE_NAMES[side][0], fill=COLORS[side],
+                          font=('Microsoft YaHei UI', 10, 'bold'))
+            for i, t in enumerate(order):
+                y = y0 + i * ICON_STEP
+                n = captured[side][t]
+                if n:
+                    c.create_oval(x - ICON_R, y - ICON_R, x + ICON_R, y + ICON_R,
+                                  fill=COLORS['face'], outline=COLORS[side], width=2)
+                    color = COLORS[side]
+                else:
+                    c.create_oval(x - ICON_R, y - ICON_R, x + ICON_R, y + ICON_R, outline='#d6d6d6')
+                    color = '#cfcfcf'
+                c.create_text(x, y, text=PIECE_NAMES[side][t], fill=color, font=('Microsoft YaHei UI', ICON_FONT, 'bold'))
+                if n >= 2:
+                    bx, by = x + ICON_R - 3, y - ICON_R + 3
+                    c.create_oval(bx - 8, by - 8, bx + 8, by + 8, fill='#c0392b', outline='white')
+                    c.create_text(bx, by, text=str(n), fill='white', font=('Microsoft YaHei UI', 8, 'bold'))
+                if latest == (side, t):  # 最近被吃的一种
+                    c.create_rectangle(x - ICON_R - 1, y + ICON_R - 9, x - ICON_R + 7, y + ICON_R - 1,
+                                       fill='#c0392b', outline='')
+            lost = lost_hp(captured[side])
+            if lost:
+                c.create_text(x, y0 + len(order) * ICON_STEP - 8, text=f'-{lost}', fill=COLORS[side],
+                              font=('Microsoft YaHei UI', 9, 'bold'))
+
     def draw_hp(self):
         c = self.hp_canvas
         c.delete('all')
-        width = COLS * CELL + 2 * MARGIN
-        bar_w = width - 110
+        width = COLS * CELL + 2 * MARGIN + 2 * SIDE_COL_W
+        left = 92  # 标签“黑方(对方)”的宽度
+        bar_w = width - left - 64
         for i, side in enumerate(('red', 'black')):
             y = 4 + i * 22
             hp = max(0, self.game.hp[side])
             label = SIDE_NAMES[side]
             if self.is_vs():
                 label += '(我)' if side == self.player_side else '(电脑)'
+            elif self.sync_side():
+                label += '(我)' if side == self.sync_side() else '(对方)'
             c.create_text(4, y + 8, text=label, anchor='w', fill=COLORS[side], font=('Microsoft YaHei UI', 9, 'bold'))
-            c.create_rectangle(70, y, 70 + bar_w - 20, y + 16, fill='#eeeeee', outline='#cccccc')
-            c.create_rectangle(70, y, 70 + (bar_w - 20) * hp / INITIAL_HP, y + 16, fill=COLORS[side], outline='')
-            c.create_text(56 + bar_w, y + 8, text=f'{hp}/{INITIAL_HP}', anchor='w')
+            c.create_rectangle(left, y, left + bar_w, y + 16, fill='#eeeeee', outline='#cccccc')
+            c.create_rectangle(left, y, left + bar_w * hp / INITIAL_HP, y + 16, fill=COLORS[side], outline='')
+            c.create_text(left + bar_w + 8, y + 8, text=f'{hp}/{INITIAL_HP}', anchor='w')
 
     def refresh(self):
         g = self.game
@@ -516,6 +659,9 @@ class App:
             self.status_var.set(f'对局结束：{SIDE_NAMES[g.winner]}获胜')
         elif self.is_vs():
             who = '轮到你' if g.current_turn == self.player_side else '电脑思考中…'
+            self.status_var.set(f'{SIDE_NAMES[g.current_turn]}行动 · {who}')
+        elif self.sync_side():
+            who = '轮到你' if g.current_turn == self.sync_side() else '对方行动'
             self.status_var.set(f'{SIDE_NAMES[g.current_turn]}行动 · {who}')
         else:
             self.status_var.set(f'{SIDE_NAMES[g.current_turn]}行动')
@@ -532,24 +678,19 @@ class App:
         self.pool_var.set('\n'.join(counts))
 
         m = g.get_multiplier()
-        self.mult_var.set(f"{m['multiplier']} = 连击系数 {m['combo_factor']} ×（翻棋 {m['flip_score']} + 血量差 {m['hp_diff']}）")
+        self.mult_var.set(f"{m['multiplier']} = 连击 {m['combo_factor']} ×（翻棋 {m['flip_score']} + 血差 {m['hp_diff']}）")
         # 每段达到 3 次的连击都累计；当前连击段达到 3 次后实时计入。
         counted = [f"{'红' if s == 'red' else '黑'}方 {m['combo_points'][s]} 分"
                    for s in ('red', 'black') if m['combo_points'][s] > 0]
         self.combo_var.set('累计连击：' + (' + '.join(counted) if counted else '无（尚无 3 连击）'))
 
-        captured = captured_pieces(g)
-        for side in ('red', 'black'):
-            parts = [f'{PIECE_NAMES[side][t]}×{n}' if n > 1 else PIECE_NAMES[side][t]
-                     for t, n in captured[side].items() if n]
-            text = ' '.join(parts) if parts else '无'
-            self.captured_labels[side].configure(
-                text=f'{SIDE_NAMES[side]}失去：{text}（-{lost_hp(captured[side])}）')
+        self.draw_captured()
 
-        self.log_list.delete(0, 'end')
-        for i, line in enumerate(self.move_log, 1):
-            self.log_list.insert('end', f'{i:>3}. {line}')
-        self.log_list.see('end')
+        self.log_text.configure(state='normal')
+        self.log_text.delete('1.0', 'end')
+        self.log_text.insert('end', '\n'.join(f'{i}. {line}' for i, line in enumerate(self.move_log, 1)))
+        self.log_text.configure(state='disabled')
+        self.log_text.see('end')
         self.update_hint_panel()
 
     # ------------------------------------------------------------------- AI
@@ -558,6 +699,7 @@ class App:
         self.ai_token += 1
         self.hint = None
         self.ai_busy = False
+        self.pondering = False
         g = self.game
         purpose = None
         if g.phase == 'playing':
@@ -565,11 +707,16 @@ class App:
                 purpose = 'move'
             elif g.current_turn in self.hint_sides():
                 purpose = 'hint'
+            elif self.can_ponder():
+                purpose = 'ponder'
         if purpose:
             token = self.ai_token
             model = self.model_var.get()
-            budget_ms = self.ai_think_budget_ms() if purpose == 'move' else self.think_budget_ms()
+            budget_ms = {'move': self.ai_think_budget_ms(), 'hint': self.think_budget_ms(),
+                         'ponder': max(1.0, float(self.config['ponder_time_sec'])) * 1000}[purpose]
             min_depth = self.hint_min_depth() if purpose == 'hint' else 0
+            # 提前计算只为填充引擎的置换表，不显示中间结果
+            on_progress = None if purpose == 'ponder' else (lambda h: self.ai_queue.put((token, 'hint_progress', h)))
             search = dict(self.config['search'])
             v16_params = self.config['v16']
             v17_params = self.config['v17']
@@ -580,13 +727,13 @@ class App:
                 threads = 4
             snapshot = g.clone()
             self.ai_busy = purpose == 'move'
+            self.pondering = purpose == 'ponder'
 
             def worker():
                 try:
                     # 局面一变（token 过期）就停止计算，不和新的计算抢 CPU
                     result = compute_hint(snapshot, model, budget_ms, search, v16_params, v17_params,
-                                          engine, threads, min_depth=min_depth,
-                                          on_progress=lambda h: self.ai_queue.put((token, 'hint_progress', h)),
+                                          engine, threads, min_depth=min_depth, on_progress=on_progress,
                                           should_stop=lambda: token != self.ai_token)
                 except Exception as exc:  # noqa: BLE001 — AI 出错不应影响对局
                     result = {'error': f'{type(exc).__name__}: {exc}'}
@@ -597,6 +744,7 @@ class App:
         self.draw_board()
 
     def _poll_ai_queue(self):
+        self._poll_sync_queue()
         try:
             while True:
                 token, purpose, result = self.ai_queue.get_nowait()
@@ -612,6 +760,8 @@ class App:
                     self.hint = result
                     self.update_hint_panel()
                     self.draw_board()
+                elif purpose == 'ponder':
+                    pass  # 结果留在引擎置换表里，界面上不用
                 elif 'error' in result or not result.get('action'):
                     self.ai_busy = False
                     self.hint_meta_var.set(result.get('error', '电脑无棋可走'))
@@ -647,7 +797,11 @@ class App:
             return
         if g.current_turn not in self.hint_sides():
             self.hint_title_var.set(f'{side_name}行动')
-            self.hint_text_var.set('（未开启该方提示）')
+            if self.pondering:
+                self.hint_text_var.set('对方思考中')
+                self.hint_meta_var.set('后台提前计算中，轮到你时提示更快更深')
+            else:
+                self.hint_text_var.set('（未开启该方提示）')
             return
         if self.hint is None:
             self.hint_title_var.set(f'{side_name} · {self.model_var.get()}')
@@ -674,14 +828,15 @@ class App:
                 elif info.get('score') is not None:
                     meta.append(f"评估 {info['score']:+.0f}")
         action = self.hint.get('action')
-        if action and action['type'] == 'flip' and not self.is_vs():
+        if action and action['type'] == 'flip' and not self.is_vs() and not self.syncing:
             meta.append('翻开后请在弹窗中录入实际翻出的棋子')
         self.hint_meta_var.set(' · '.join(meta))
-        if action:
+        if action and not self.syncing:
             self.follow_btn.state(['!disabled'])
 
     def follow_hint(self):
-        if not self.hint or not self.hint.get('action') or self.game.phase != 'playing' or self.ai_busy:
+        if not self.hint or not self.hint.get('action') or self.game.phase != 'playing' or self.ai_busy \
+                or self.syncing:
             return
         a = self.hint['action']
         if a['type'] == 'flip':
@@ -691,6 +846,8 @@ class App:
 
     # ---------------------------------------------------------- interaction
     def on_click(self, event):
+        if self.syncing:
+            return  # 局面由画面同步，手动录入会和画面对不上
         col = int((event.x - MARGIN) // CELL)
         row = int((event.y - MARGIN) // CELL)
         if not (0 <= row < ROWS and 0 <= col < COLS):
@@ -873,6 +1030,84 @@ class App:
         # 导入的局面没有更早的历史，悔棋不能越过它
         self.min_history = len(game.history)
         self.after_action()
+
+    # ------------------------------------------------------------ 画面同步
+    def toggle_sync(self):
+        if self.syncing:
+            self.stop_sync()
+        else:
+            self.start_sync()
+
+    def start_sync(self):
+        if self.is_vs():
+            return
+        try:
+            from .sync import BoardSync, ScreenWatcher
+            from .vision import default_templates
+            default_templates()
+        except ImportError:
+            messagebox.showerror('画面同步', '画面识别需要 numpy 和 Pillow：\npip install numpy pillow')
+            return
+        except FileNotFoundError as exc:
+            messagebox.showerror('画面同步', str(exc))
+            return
+        self.board_sync = BoardSync(self.config.get('rules'))
+        self.sync_synced = False  # 第一次识别结果出来前，界面上的对局与画面无关
+        self.sync_watcher = ScreenWatcher(lambda kind, payload: self.sync_queue.put((kind, payload)))
+        self.sync_watcher.start()
+        self.sync_btn.configure(text='停止同步')
+        self.sync_status_var.set('正在查找屏幕上的棋盘…')
+        self.clear_selection()
+        self.request_ai()
+        self.refresh()
+
+    def stop_sync(self):
+        if not self.syncing:
+            return
+        self.sync_watcher.stop()
+        self.sync_watcher = None
+        while not self.sync_queue.empty():
+            self.sync_queue.get_nowait()
+        self.sync_btn.configure(text='开始同步')
+        self.sync_status_var.set('已停止同步；可以继续手动录入')
+        self.request_ai()
+        self.refresh()
+
+    def _poll_sync_queue(self):
+        while self.syncing:
+            try:
+                kind, payload = self.sync_queue.get_nowait()
+            except queue.Empty:
+                return
+            if kind == 'status':
+                self.sync_status_var.set(payload)
+            else:
+                self.apply_sync(payload)
+
+    def apply_sync(self, rec):
+        update = self.board_sync.update(rec, self.game if self.sync_synced else None)
+        if update.kind in ('step', 'turn', 'new', 'import'):
+            self.sync_synced = True
+            self.game = update.game
+            if update.kind in ('new', 'import'):
+                self.move_log = list(update.log)
+                # 同步开始前的历史不存在，悔棋不能越过它
+                self.min_history = len(self.game.history)
+            else:
+                self.move_log.extend(update.log)
+            if self.game.phase == 'over':
+                self.move_log.append('—— 和棋 ——' if self.game.winner == 'draw'
+                                     else f'—— {SIDE_NAMES[self.game.winner]}获胜 ——')
+            self.clear_selection()
+            self.request_ai()
+            self.refresh()
+        mine = self.sync_side()
+        parts = ['同步中', f'我执{SIDE_NAMES[mine]}' if mine else '还认不出我执哪一方（翻出第一个子后确定）']
+        if self.sync_synced and self.game.phase == 'playing' and mine:
+            parts.append('轮到我' if self.game.current_turn == mine else '对方行动')
+        if update.message:
+            parts.append(update.message)
+        self.sync_status_var.set(' · '.join(parts))
 
     def save_log(self):
         path = filedialog.asksaveasfilename(

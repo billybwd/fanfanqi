@@ -8,6 +8,8 @@
     python -m tests.selfplay StrategicV17AI StrategicV16AI 10 0.3  # 新旧策略基准
 """
 
+import glob
+import os
 import random
 import sys
 import time
@@ -48,12 +50,14 @@ class RandomAI:
 def make_player(name, side, budget_ms):
     """name 可写成 StrategicV16AI:λ 或 StrategicV16AI:λ,κ（如 StrategicV16AI:0.5,1.5），
     冒号后为 V16 的 multiplier_exponent / loss_aversion；也接受旧写法 :reward / :win。
-    前缀 go/ 使用 Go 引擎（单线程），如 go/StrategicV17AI。"""
+    前缀 go/ 使用 Go 引擎（单线程），如 go/StrategicV17AI。
+    末尾可加 +参数=值 覆盖单个参数（可多个），如 go/StrategicV17AI+search_ext=0+keep_tt=0。"""
     if name == 'random':
         return RandomAI(side)
     engine = 'python'
     if name.startswith('go/'):
         engine, name = 'go', name[3:]
+    name, *overrides = name.split('+')
     model, _, objective = name.partition(':')
     strategy_params = None
     if objective in ('reward', 'win'):
@@ -63,6 +67,10 @@ def make_player(name, side, budget_ms):
         strategy_params = {'multiplier_exponent': float(lam)}
         if kappa:
             strategy_params['loss_aversion'] = float(kappa)
+    for item in overrides:
+        key, _, value = item.partition('=')
+        strategy_params = strategy_params or {}
+        strategy_params[key] = float(value) if '.' in value else int(value)
     if model == 'StrategicV17AI':
         return create_ai(model, side, budget_ms, v17_params=strategy_params, engine=engine)
     return create_ai(model, side, budget_ms, v16_params=strategy_params, engine=engine)
@@ -181,8 +189,118 @@ def run_tests():
             worst = max(worst, abs(total - score))
         check(f'{name}：{len(positions)} 个局面最大误差 {worst:.1e}', worst < 1e-9)
 
+    go_parity_tests(check)
+    vision_tests(check)
     print(f'\n{"全部通过" if failures == 0 else f"{failures} 项失败"}')
     return failures
+
+
+def go_parity_tests(check):
+    """Go 引擎关闭搜索增强（search_ext=0）、不保留置换表时，固定深度下与 Python V17 选同一步。没有 Go 时跳过。"""
+    from fanfanqi.go_engine import GoEngineAI
+    try:
+        from fanfanqi.go_engine import _engine_binary
+        _engine_binary()
+    except RuntimeError as exc:
+        print(f'\nGo 引擎：{exc}，跳过')
+        return
+    print('\nGo 引擎与 Python V17 一致（固定 2 层）')
+    rng = random.Random(5)
+    same = total = 0
+    while total < 12:
+        g = Game()
+        random_setup(g)
+        for _ in range(rng.randrange(4, 40)):
+            if g.phase != 'playing':
+                break
+            apply_real(g, rng.choice(g.get_all_actions()))
+        if g.phase != 'playing':
+            continue
+        go = GoEngineAI('StrategicV17AI', g.current_turn, 60000, {'max_depth': 2, 'search_ext': 0, 'keep_tt': 0})
+        py = StrategicV17AI(g.current_turn, {'max_depth': 2})
+        py.time_budget_ms = 60000
+        total += 1
+        same += go.get_move(g.clone()) == py.get_move(g.clone())
+    check(f'{same}/{total} 个局面着法相同', same == total)
+
+
+def vision_tests(check):
+    """画面识别：需要 numpy 和 Pillow；有本地截图（sample_image/，不入库）时逐张识别并校验。"""
+    try:
+        from fanfanqi import vision
+    except ImportError:
+        print('\n画面识别：未安装 numpy / Pillow，跳过')
+        return
+    print('\n画面识别')
+    board = [['?'] * 4 for _ in range(8)]
+    for r, c in ((0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)):
+        board[r][c] = '.'
+    result = vision.Recognition(layout=None, board=board,
+                                captured={'red': {'兵': 3}, 'black': {'马': 1}})
+    vision._fix_soldier_count(result, 'red')
+    check('兵/卒数量角标按空格数修正（3 → 5）', result.captured['red']['兵'] == 5 and result.notes)
+    sync_tests(check, vision)
+
+    folder =os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sample_image')
+    paths = sorted(glob.glob(os.path.join(folder, '*.png')))
+    if not paths:
+        print('  没有 sample_image/ 截图，跳过逐张识别')
+        return
+    from PIL import Image
+    bad = []
+    for path in paths:
+        result = vision.recognize(Image.open(path))
+        if result.problems:
+            bad.append(f'{os.path.basename(path)}：{result.problems[0]}')
+    check(f'{len(paths)} 张截图识别结果自洽' + ('' if not bad else '：' + bad[0]), not bad)
+
+
+def sync_tests(check, vision):
+    """画面同步：随机对局，每步（偶尔漏看一步）把真实局面当作识别结果交给 BoardSync，
+    同步出的对局应与真实对局完全一致（含连击、开局翻棋分、长捉和未吃子计数）。"""
+    from fanfanqi.sync import BoardSync, _captured, board_tokens
+
+    def rec_of(game, turn=None, certain=True):
+        return vision.Recognition(layout=None, board=board_tokens(game), captured=_captured(game),
+                                  players={'bottom': 'red', 'top': 'black'},
+                                  turn=turn or game.current_turn, turn_certain=certain)
+
+    def fields(g):
+        return (board_tokens(g), _captured(g), g.hp, g.combo, g.combo_score, g.flip_score,
+                g.no_capture_plies, g.chase_count, g.chase_target, g.current_turn, g.phase)
+
+    rng = random.Random(7)
+    kinds, same = {}, True
+    for _ in range(8):
+        real = Game()
+        random_setup(real)
+        sync, mine, now, skipped = BoardSync(), None, 0.0, False
+        for _ in range(150):
+            if real.phase != 'playing':
+                break
+            skip = mine is not None and not skipped and rng.random() < 0.2
+            skipped = skip
+            if not skip:
+                now += 2
+                update = sync.update(rec_of(real), mine, now=now)
+                kinds[update.kind] = kinds.get(update.kind, 0) + 1
+                mine = update.game or mine
+                same = same and fields(mine) == fields(real)
+            apply_real(real, rng.choice(real.get_all_actions()))
+    check(f'画面同步逐步推进与真实对局一致（{kinds}）', same and set(kinds) == {'new', 'step'})
+
+    # 轮次：刚走完一步时画面轮次与轮流走子不符先不改，稳定后以画面为准
+    sync = BoardSync()
+    game = Game()
+    random_setup(game)
+    game = sync.update(rec_of(game), None, now=0.0).game
+    other = 'black' if game.current_turn == 'red' else 'red'
+    lagging = sync.update(rec_of(game, turn=other), game, now=1.0)
+    corrected = sync.update(rec_of(game, turn=other), game, now=3.0)
+    uncertain = sync.update(rec_of(game, turn=other, certain=False), game, now=9.0)
+    check('画面轮次：走子后 1.5 秒内不改、之后按画面纠正、无直接依据时不改',
+          lagging.kind == 'same' and corrected.kind == 'turn' and corrected.game.current_turn == other
+          and uncertain.kind == 'same')
 
 
 if __name__ == '__main__':
