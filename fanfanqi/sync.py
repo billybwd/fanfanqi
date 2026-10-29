@@ -238,18 +238,33 @@ class ScreenWatcher(threading.Thread):
     """后台截屏识别。post(kind, payload)：('rec', Recognition) 识别结果，('status', 文本) 状态。
 
     interval  截屏间隔（秒）；settle 画面连续不变多久才识别；refresh 画面不变时多久复查一次（轮次、倒计时框）。
-    画面一直在变（特效动画）超过 3 秒时也照常识别，连续两次一致才交出。"""
+    画面一直在变（特效动画）超过 3 秒时也照常识别，连续两次一致才交出。
+    save_failed  画面静止却识别出问题时，把棋盘一带存到 sample_image/failed（同一画面只存一次，最多每 5 秒一张）。"""
 
-    def __init__(self, post, interval=0.15, settle=0.3, refresh=0.5, grab=None, templates=None):
+    def __init__(self, post, interval=0.15, settle=0.3, refresh=0.5, grab=None, templates=None, save_failed=False):
         super().__init__(daemon=True)
         self.post = post
         self.interval, self.settle, self.refresh = interval, settle, refresh
         self.grab = grab
         self.templates = templates
+        self.save_failed = save_failed
+        self._saved = (None, 0.0)
         self._stop_event = threading.Event()
 
     def stop(self):
         self._stop_event.set()
+
+    def _save_failed(self, vision, rgb, layout, rec, now):
+        key, at = self._saved
+        if _key(rec) == key or now - at < 5.0:
+            return
+        self._saved = (_key(rec), now)
+        try:
+            path = vision.save_frame(rgb, layout, rec.problems)
+        except OSError:
+            return
+        if path:
+            self.post('status', f'识别没把握的画面已存到 {path}')
 
     def run(self):
         from . import vision
@@ -287,6 +302,8 @@ class ScreenWatcher(threading.Thread):
             if due and (settled or busy_too_long or not dirty):
                 recognized_at = started
                 rec = vision.recognize(rgb, templates, layout)
+                if self.save_failed and settled and rec.problems and not rec.game_over:
+                    self._save_failed(vision, rgb, layout, rec, started)
                 if not rec.game_over and rec.quality < vision.GOOD_QUALITY:
                     poor += 1
                     if poor >= 2:  # 连续两次对不上：棋盘移动了或被遮挡，重新找

@@ -431,6 +431,10 @@ python -m fanfanqi.vision --out state.json            # 不给图片时截取整
 对局中会被上面的空格数核对修正）。换皮肤或识别出错时，把截图放进 `sample_image/`（已加入 .gitignore）
 按 `tools/vision_templates.py` 顶部的步骤重新生成模板。
 
+字形距离（灰度归一化后的均方根差，0 = 相同）的余量：把样本缩放到 0.45～1 倍测试，正确字形的距离最大 0.45，
+与别的字形的距离最小 0.80，判定线 `GLYPH_MAX = 0.75` 落在两者之间。同步时画面静止却识别出问题的帧会自动存到
+`sample_image/failed/`（只截棋盘一带，附问题说明，最多 200 张；设置项 `save_failed_frames`），可直接拿来补模板。
+
 ### 画面同步（fanfanqi/sync.py）
 
 界面「画面同步 → 开始同步」：

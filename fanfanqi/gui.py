@@ -1053,7 +1053,8 @@ class App:
             return
         self.board_sync = BoardSync(self.config.get('rules'))
         self.sync_synced = False  # 第一次识别结果出来前，界面上的对局与画面无关
-        self.sync_watcher = ScreenWatcher(lambda kind, payload: self.sync_queue.put((kind, payload)))
+        self.sync_watcher = ScreenWatcher(lambda kind, payload: self.sync_queue.put((kind, payload)),
+                                          save_failed=self.config.get('save_failed_frames', True))
         self.sync_watcher.start()
         self.sync_btn.configure(text='停止同步')
         self.sync_status_var.set('正在查找屏幕上的棋盘…')

@@ -17,6 +17,7 @@ game_from_state() 校验（明子 + 被吃 ≤ 总数、暗子数 = 剩余池、
 import argparse
 import json
 import os
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -583,6 +584,25 @@ def grab_screen(bbox=None):
     """截取屏幕（Windows / macOS）；bbox = (左, 上, 右, 下)。"""
     from PIL import ImageGrab
     return ImageGrab.grab(bbox=bbox, all_screens=True)
+
+
+FAILED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sample_image', 'failed')
+
+
+def save_frame(rgb, layout, problems, directory=FAILED_DIR, limit=200):
+    """把识别没把握的画面存下来（只截棋盘、被吃子栏和头像一带，不存整个屏幕），附上问题说明，
+    之后可以用 tools/vision_templates.py 补模板。目录里已有 limit 张时不再保存。返回文件路径或 None。"""
+    os.makedirs(directory, exist_ok=True)
+    if len([n for n in os.listdir(directory) if n.endswith('.png')]) >= limit:
+        return None
+    (x0, y0), (x1, y1) = layout.point(-3.8, -0.6), layout.point(8.2, 9.0)
+    h, w = rgb.shape[:2]
+    patch = rgb[max(0, int(y0)):min(h, int(y1)), max(0, int(x0)):min(w, int(x1))]
+    path = os.path.join(directory, time.strftime('%Y%m%d-%H%M%S') + f'-{int(time.time() * 1000) % 1000:03d}.png')
+    Image.fromarray(np.ascontiguousarray(patch)).save(path)
+    with open(path[:-4] + '.txt', 'w', encoding='utf-8') as f:
+        f.write('\n'.join(problems) + '\n')
+    return path
 
 
 def format_board(board):
