@@ -56,6 +56,14 @@ DEFAULT_PARAMS.update({
     'early_chance_samples': 6,
     'mid_chance_samples': 8,
 })
+# Evaluation weights from SPSA self-play tuning (2026-10-30, 3000 game pairs; tools/tune.py): chariot and
+# horse lower, king safety (king, cannons aiming at it) higher. Against the previous V16 values it scored
+# -8 Elo over 300 games at 1 s/move (95% interval -45 ~ +28), i.e. no measurable loss; kept because it is
+# closer to human judgement. Previous values: params/v17-before-spsa-20261030.json.
+DEFAULT_PARAMS['weights'].update({'hanging': 0.62, 'pool': 0.28, 'king_cannon': 5.79})
+DEFAULT_PARAMS['weights']['piece_value'] = {
+    '将': 10.56, '仕': 6.05, '象': 2.94, '车': 2.09, '马': 1.55, '炮': 3.23, '兵': 1.57,
+}
 
 
 _MASK64 = (1 << 64) - 1
@@ -385,9 +393,7 @@ class StrategicV17AI:
     def __init__(self, side, params=None):
         self.side = side
         self.time_budget_ms = 2500
-        self.params = merge_params(params)
-        self.params.update({k: v for k, v in DEFAULT_PARAMS.items()
-                            if k not in self.params})
+        self.params = merge_params(params, DEFAULT_PARAMS)  # 补全到 V17 自己的默认值（评估权重与 V16 不同）
         self.last_decision_info = None
         self.on_progress = None
         self.should_stop = None

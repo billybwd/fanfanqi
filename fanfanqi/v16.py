@@ -856,10 +856,12 @@ def move_to_action(move):
     }
 
 
-def merge_params(overrides):
-    params = {k: (dict(v) if isinstance(v, dict) else v) for k, v in DEFAULT_PARAMS.items()}
-    params['weights'] = dict(DEFAULT_PARAMS['weights'])
-    params['weights']['piece_value'] = dict(DEFAULT_PARAMS['weights']['piece_value'])
+def merge_params(overrides, defaults=None):
+    """把 overrides（可以只给部分参数，weights / piece_value 按键合并）补全到 defaults（默认 V16 的）上。"""
+    defaults = defaults or DEFAULT_PARAMS
+    params = {k: (dict(v) if isinstance(v, dict) else v) for k, v in defaults.items()}
+    params['weights'] = dict(defaults['weights'])
+    params['weights']['piece_value'] = dict(defaults['weights']['piece_value'])
     for k, v in (overrides or {}).items():
         if k == 'weights' and isinstance(v, dict):
             for wk, wv in v.items():

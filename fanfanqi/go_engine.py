@@ -163,6 +163,17 @@ def _engine_process():
         return engine
 
 
+def full_params(model_name, params):
+    """把（可能只给了部分的）参数补全成 Python 版同一模型的完整参数再交给 Go 引擎：Go 引擎里写死的默认值
+    只是兜底，V16 / V17 的默认评估权重不同，以 Python 版为准，两边才能一致。Go 专用参数（search_ext 等）原样保留。"""
+    if model_name == 'StrategicV17AI':
+        from .v17 import DEFAULT_PARAMS
+    else:
+        from .v16 import DEFAULT_PARAMS
+    from .v16 import merge_params
+    return merge_params(params, DEFAULT_PARAMS)
+
+
 class GoEngineAI:
     def __init__(self, model_name, side, time_budget_ms, params=None, threads=1):
         self.model_name = model_name
@@ -181,7 +192,7 @@ class GoEngineAI:
             'threads': self.threads,
             'time_budget_ms': self.time_budget_ms,
             'state': game_to_state(game),
-            'params': self.params,
+            'params': full_params(self.model_name, self.params),
             'progress': self.on_progress is not None,
         }
         response, stopped = _engine_process().run(request, self.on_progress, self.should_stop,
