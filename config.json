@@ -1,5 +1,5 @@
 {
-  "mode": "vs",
+  "mode": "record",
   "player_side": "red",
   "ai_model": "StrategicV17AI",
   "engine": "go",
@@ -12,7 +12,8 @@
   "ai_think_time_sec": 2.0,
   "hint_min_depth": 6,
   "hint_side": "red",
-  "show_hint_on_board": false,
+  "show_hint_on_board": true,
+  "win_now_multiplier": 1000,
   "ponder": false,
   "ponder_time_sec": 30,
   "save_failed_frames": true,

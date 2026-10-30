@@ -26,7 +26,8 @@ from PIL import Image
 
 ROWS, COLS = 8, 4
 TILE = 32            # 格子特征图边长
-OCCUPIED_EDGE = 169  # 棋子边缘亮度低于此值视为有子（样本：有子 ≤163，空格 ≥175）
+OCCUPIED_TEXTURE = 9  # 格子中间一圈的灰度标准差高于此值视为有子（空格 ≤5.5，有子 ≥13.4，含连击特效）
+GREEN_DOT = 8        # 暗子中心 g − r 高于此值视为有绿色选中点（有点 ≈15，其他 ≤0）
 RING_MIN = 15        # 光圈强度阈值（样本：普通棋子 ≤8，有光圈 ≥22）
 DOT_MIN = 85         # 黄点强度阈值（样本：其他 ≤63，黄点 ≈104）
 RED_INK = 40         # 字迹 r − g 高于此值为红字（样本：黑字 ≤20，红字 ≥50）
@@ -52,6 +53,11 @@ PLAYERS = {
     'bottom': {'avatar': (5.25, 7.35, 1.2), 'icon': (4.87, 8.26), 'bar_row': 8.26, 'bar_span': (4.7, 7.6), 'bar_full': 7.25},
 }
 BUTTON_BOX = (2.0, 4.45, 2.8, 0.6)  # 「开始」按钮：中心列、中心行、宽、高（格）
+# 右上角倍率数字所在的行（格），在这几列范围内找（样本中数字在 7.1~7.7 列、-0.36~-0.11 行）
+MULT_ROWS = (-0.42, -0.06)
+MULT_COLS = (4.6, 10.0)
+DIGIT_SIZE = (12, 20)  # 倍率数字图块（宽、高）
+DIGIT_MAX = 0.6        # 数字字形距离超过此值认为没把握，不读倍率
 
 
 @dataclass
@@ -197,23 +203,41 @@ def cell_tile(rgb, layout, row, col, inner=0.62):
 
 
 GLYPH_RETRY = 0.45  # 距离超过此值时在附近微调取样位置再匹配
+# 第一轮：定位差一两个像素；第二轮：选中后抬起放大的棋子（约 1.08 倍、上下偏 0.1 格左右）
+NEAR_OFFSETS = [(dx, dy, 0.62) for dy in (-0.04, -0.02, 0.0, 0.02, 0.04) for dx in (-0.04, -0.02, 0.0, 0.02, 0.04)]
+LIFTED_OFFSETS = [(dx, round(dy, 2), inner) for inner in (0.67, 0.72) for dy in np.arange(-0.15, 0.16, 0.03)
+                  for dx in (-0.06, -0.03, 0.0, 0.03, 0.06)]
+
+
+def _erase_dot(patch, cell, dx=0.0, dy=0.0):
+    """暗子正中的绿色小圆点（对方选中/悬停的标记）用周围的颜色盖掉，免得字形对不上。
+    (dx, dy) 是取样框相对格子中心的偏移，圆点在取样框里的位置要反向挪。"""
+    h, w = patch.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    d = np.hypot(xx - ((w - 1) / 2 - dx * cell), yy - ((h - 1) / 2 - dy * cell)) / cell
+    center = patch[d < 0.05].astype(np.int16)
+    if not len(center) or float((center[:, 1] - center[:, 0]).mean()) < GREEN_DOT:
+        return patch
+    patch = patch.copy()
+    patch[d < 0.1] = patch[(d >= 0.1) & (d < 0.14)].mean(axis=0).astype(patch.dtype)
+    return patch
 
 
 def _match_cell(rgb, layout, row, col, templates):
-    """字形匹配；没把握时把取样框在 ±0.04 格内挪动再试（定位差一两个像素，缩小后的字形就对不齐）。"""
-    tile = cell_tile(rgb, layout, row, col)
-    label, d = templates.cell_glyph(tile)
-    if d <= GLYPH_RETRY:
-        return tile, label, d
-    for dy in (-0.04, -0.02, 0.0, 0.02, 0.04):
-        for dx in (-0.04, -0.02, 0.0, 0.02, 0.04):
-            patch = layout.crop(rgb, col + 0.5 + dx, row + 0.5 + dy, 0.62, 0.62)
-            if patch is None or (dx == 0 and dy == 0):
+    """字形匹配；没把握时挪动、放大取样框再试，取最像的一次。"""
+    tile = label = None
+    d = float('inf')
+    for offsets in ([(0.0, 0.0, 0.62)], NEAR_OFFSETS, LIFTED_OFFSETS):
+        for dx, dy, inner in offsets:
+            patch = layout.crop(rgb, col + 0.5 + dx, row + 0.5 + dy, inner, inner)
+            if patch is None:
                 continue
-            t = _resize(patch, (TILE, TILE))
+            t = _resize(_erase_dot(patch, layout.cell, dx, dy), (TILE, TILE))
             lab, dist = templates.cell_glyph(t)
             if dist < d:
                 tile, label, d = t, lab, dist
+        if d <= GLYPH_RETRY:
+            break
     return tile, label, d
 
 
@@ -231,7 +255,8 @@ def _ring_mask(shape, cell, r0, r1):
 
 def cell_signals(patch, layout):
     """格子的几个简单信号：
-    edge   棋子边缘一圈的亮度（有子约 140~163，空格约 175~208）；
+    texture  中间一圈（半径 0.12~0.36 格）的灰度标准差：有子（字迹或暗子花纹）≥13，空木板 ≤6，
+             不受连击火焰、发光等整体变亮变暗的影响，用它判断有没有子；
     ring   金色光圈强度（上一步终点；半径 0.42~0.47 处 g−b 比外侧高约 25）；
     dot    中心黄点强度（上一步起点，只出现在空格；g−b 约 104，空格约 52）。"""
     def ring(r0, r1):
@@ -241,7 +266,7 @@ def cell_signals(patch, layout):
         return float((px[:, 1] - px[:, 2]).mean())
 
     return {
-        'edge': float(ring(0.38, 0.42).mean()),
+        'texture': float(ring(0.12, 0.36).mean(axis=1).std()),
         'ring': yellow(ring(0.42, 0.47)) - yellow(ring(0.49, 0.53)),
         'dot': yellow(ring(0, 0.05)),
     }
@@ -291,13 +316,90 @@ def badge_present(rgb, layout, col, row):
     return len(px) > 0 and float(((px[:, 0] > 170) & (px[:, 1] < 110)).mean()) >= BADGE_MIN
 
 
-def badge_tile(rgb, layout, col, row, size=0.24):
-    return _resize(layout.crop(rgb, col + 0.2, row - 0.2, size, size), (16, 16))
+def badge_tile(rgb, layout, col, row):
+    """数量角标：按红色圆的位置和大小对齐后取 16 × 16，只留圆内的亮度（白色数字），圆外填成圆的颜色。
+    窗口大小不同时角标的相对位置、大小略有出入，直接按固定框裁剪会把背景和图标边缘也算进去。"""
+    patch = layout.crop(rgb, col + 0.2, row - 0.2, 0.4, 0.4)
+    if patch is None:
+        return None
+    p = patch.astype(np.int16)
+    red = (p[..., 0] > 150) & (p[..., 0] - p[..., 1] > 50) & (p[..., 0] - p[..., 2] > 50)
+    ys, xs = np.where(red)
+    if len(xs) < 10:
+        return None
+    cx, cy = float(np.median(xs)), float(np.median(ys))
+    r = float(np.sqrt(red.sum() / np.pi)) * 1.08  # 红色面积不含白色数字，略放大
+    x0, y0 = max(0, int(round(cx - r))), max(0, int(round(cy - r)))
+    sub = p[y0:int(round(cy + r)) + 1, x0:int(round(cx + r)) + 1]
+    h, w = sub.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    inside = np.hypot(xx - (cx - x0), yy - (cy - y0)) <= r * 0.92
+    g = sub.min(axis=2)  # 白色数字三个通道都高，红色圆的最小通道低
+    g[~inside] = g[inside].min()
+    g = _resize(g.astype(np.uint8), (16, 16))
+    return np.repeat(g[..., None], 3, axis=2)
 
 
 def button_tile(rgb, layout):
     patch = layout.crop(rgb, *BUTTON_BOX)
     return None if patch is None else _resize(patch, (96, 20))
+
+
+def multiplier_tiles(rgb, layout):
+    """右上角“倍率”框里的黄色数字，从左到右切成单个数字的图块（DIGIT_SIZE，按数字高度等比放进框里）。
+    框贴着游戏窗口右上角，和棋盘的相对位置随窗口宽度变化，所以在棋盘右侧一段较宽的范围里找；
+    连击火焰会让数字偏橙，按“亮、偏黄、蓝色低”取像素。找不到成组的数字时返回 None。"""
+    h, w = rgb.shape[:2]
+    x0, y0 = layout.point(MULT_COLS[0], MULT_ROWS[0])
+    x1, y1 = layout.point(MULT_COLS[1], MULT_ROWS[1])
+    x0, x1, y0, y1 = max(0, int(x0)), min(w, int(x1)), max(0, int(y0)), min(h, int(y1))
+    if x1 - x0 < 10 or y1 - y0 < 5:
+        return None
+    px = rgb[y0:y1, x0:x1].astype(np.int16)
+    r, g, b = px[..., 0], px[..., 1], px[..., 2]
+    mask = (r > 190) & (g > 130) & (b < 110) & (g - b > 80)
+    cols = np.where(mask.sum(axis=0) > 0)[0]
+    if not len(cols):
+        return None
+    runs, start = [], cols[0]  # 按空白列切开：每段是一个数字
+    for a, c in zip(cols, cols[1:]):
+        if c - a > 1:
+            runs.append((start, a + 1))
+            start = c
+    runs.append((start, cols[-1] + 1))
+    min_height = 0.15 * layout.cell
+    digits = []
+    for a, c in runs:
+        ys = np.where(mask[:, a:c].any(axis=1))[0]
+        if len(ys) and ys[-1] - ys[0] + 1 >= min_height:
+            digits.append((a, c))
+    if not digits:
+        return None
+    # 只要靠在一起的一组（数字间距很小），取最长的一组
+    groups, current = [], [digits[0]]
+    for d in digits[1:]:
+        if d[0] - current[-1][1] <= 0.12 * layout.cell:
+            current.append(d)
+        else:
+            groups.append(current)
+            current = [d]
+    groups.append(current)
+    group = max(groups, key=len)
+    rows = np.where(mask[:, group[0][0]:group[-1][1]].any(axis=1))[0]
+    top, bottom = rows[0], rows[-1] + 1
+    height = bottom - top
+    width = int(round(height * DIGIT_SIZE[0] / DIGIT_SIZE[1]))
+    if max(c - a for a, c in group) > 1.3 * width:
+        return None  # 比一个数字宽得多：几个数字连在一起或者是别的东西
+    width = max(width, max(c - a for a, c in group))
+    tiles = []
+    for a, c in group:
+        sub = np.clip(r[top:bottom, a:c] - b[top:bottom, a:c], 0, 255).astype(np.uint8)  # 黄色越纯越亮
+        box = np.zeros((height, width), np.uint8)
+        offset = (width - (c - a)) // 2
+        box[:, offset:offset + c - a] = sub
+        tiles.append(np.repeat(_resize(box, DIGIT_SIZE)[..., None], 3, axis=2))
+    return tiles
 
 
 def _center_dialog(rgb, layout):
@@ -322,6 +424,8 @@ class Templates:
             self.badge_labels = list(data['badge_labels']) if 'badge_labels' in data.files else []
             self.badge = np.stack([glyph(t) for t in data['badge_tiles']]) if self.badge_labels else None
             self.button = glyph(data['button']) if 'button' in data.files else None
+            self.digit_labels = list(data['digit_labels']) if 'digit_labels' in data.files else []
+            self.digit = np.stack([glyph(t) for t in data['digit_tiles']]) if self.digit_labels else None
 
     @staticmethod
     def _nearest(features, labels, tile):
@@ -337,6 +441,18 @@ class Templates:
             return None, 0.0
         label, d = self._nearest(self.badge, self.badge_labels, tile)
         return int(label), d
+
+    def multiplier(self, tiles):
+        """倍率数字图块 → 整数；没有模板、没切出数字或有一位没把握时返回 None。"""
+        if self.digit is None or not tiles:
+            return None
+        digits = []
+        for tile in tiles:
+            label, d = self._nearest(self.digit, self.digit_labels, tile)
+            if d > DIGIT_MAX:
+                return None
+            digits.append(label)
+        return int(''.join(digits))
 
     def is_button(self, tile):
         return self.button is not None and tile is not None and float((glyph(tile) * self.button).mean()) >= BUTTON_MIN
@@ -368,6 +484,7 @@ class Recognition:
     quality: float = 1.0                             # 有子格中字形匹配可信的比例
     problems: list = field(default_factory=list)     # 不自洽、没把握的地方
     notes: list = field(default_factory=list)        # 按规则自动修正过的地方
+    multiplier: int = None                           # 右上角显示的倍率（含抢红/加倍系数），认不出为 None
 
     @property
     def my_side(self):
@@ -403,17 +520,22 @@ def _player_side(rgb, layout, info):
 
 
 def _hp_bar(rgb, layout, info, side):
-    """血量条右端位置换算成血量；条太短（被图标挡住）或画面外时返回 None。"""
+    """血量条右端位置换算成血量；条太短（被图标挡住）或画面外时返回 None。
+    条中间叠着白色的“33/60”文字，会盖住填充的末端，所以只看条的上下边缘（离中线 0.06~0.1 格），
+    任一行是填充色就算填到这里。颜色按相对值判断：连击特效会把整条压暗。"""
     x0, y = layout.point(info['bar_span'][0], info['bar_row'])
     x1, _ = layout.point(info['bar_span'][1], info['bar_row'])
-    if y + 3 > rgb.shape[0] or x0 < 0 or x1 > rgb.shape[1]:
+    band = int(round(0.1 * layout.cell))
+    if y + band + 1 > rgb.shape[0] or y - band < 0 or x0 < 0 or x1 > rgb.shape[1]:
         return None
-    line = rgb[int(y) - 2:int(y) + 3, int(x0):int(x1)].astype(np.int16).mean(axis=0)
+    rows = [int(round(y + s * k)) for s in (-1, 1) for k in range(int(round(0.06 * layout.cell)), band + 1)]
+    px = rgb[rows, int(x0):int(x1)].astype(np.int16)
+    r, g, b = px[..., 0], px[..., 1], px[..., 2]
     if side == 'red':
-        filled = (line[:, 0] > 190) & (line[:, 1] < 120) & (line[:, 2] < 120)
+        filled = (r > 180) & (r - g > 100) & (r - b > 90)
     else:
-        filled = (line[:, 2] > 200) & (line[:, 0] < 120)
-    xs = np.where(filled)[0]
+        filled = (b > 150) & (b - r > 80)
+    xs = np.where(filled.any(axis=0))[0]
     if not len(xs):
         return None
     end = (x0 + xs[-1] - layout.x) / layout.cell
@@ -462,6 +584,7 @@ def recognize(image, templates=None, layout=None):
         raise ValueError('没有找到棋盘')
     result = Recognition(layout=layout)
     result.game_over = templates.is_button(button_tile(rgb, layout))
+    result.multiplier = templates.multiplier(multiplier_tiles(rgb, layout))
     center_dialog = _center_dialog(rgb, layout)
 
     # 棋盘
@@ -472,7 +595,7 @@ def recognize(image, templates=None, layout=None):
         tokens = []
         for col in range(COLS):
             signals = cell_signals(cell_patch(rgb, layout, row, col), layout)
-            if signals['edge'] >= OCCUPIED_EDGE:
+            if signals['texture'] < OCCUPIED_TEXTURE:
                 tokens.append('.')
                 if signals['dot'] >= DOT_MIN:
                     froms.append((row, col))
@@ -521,7 +644,7 @@ def recognize(image, templates=None, layout=None):
         result.problems.append('上下两位玩家识别成了同一方')
     for where, info in PLAYERS.items():
         side = result.players[where]
-        if side:
+        if side and shown[where]:  # 图标不在（连击特效）时那里是特效画面，不是血量条
             result.hp_bar[side] = _hp_bar(rgb, layout, info, side)
     result.turn, result.turn_certain = _whose_turn(rgb, layout, result.players, shown)
 
@@ -535,14 +658,11 @@ def recognize(image, templates=None, layout=None):
                 continue
             n = 1
             if badge_present(rgb, layout, col, row):
-                # 数字很小，图标大小/缩放略有变化时单一裁剪框容易切掉笔画；
-                # 用几个相邻尺度匹配，选与现有数字模板最接近的一次。
-                matches = [templates.badge_count(badge_tile(rgb, layout, col, row, size))
-                           for size in (0.20, 0.24, 0.28)]
-                n, d = min(matches, key=lambda item: item[1])
+                tile = badge_tile(rgb, layout, col, row)
+                n, d = templates.badge_count(tile) if tile is not None else (None, 0.0)
                 if n is None:
                     n = 2
-                    result.problems.append('没有数量角标模板，按 2 个计')
+                    result.problems.append('没有数量角标模板或看不清角标，按 2 个计')
                 if t != '兵' and n != 2:
                     result.problems.append(f'{name} 栏「{t}」的数量识别为 {n}，最多 2 个，按 2 计')
                     n = 2
@@ -682,7 +802,7 @@ def main():
     print(format_board(result.board))
     print(f"被吃：红 {result.captured.get('red')}  黑 {result.captured.get('black')}")
     print(f"上方 {result.players.get('top')} / 下方（自己）{result.players.get('bottom')}，"
-          f"轮到 {result.turn}，血量条 {result.hp_bar}")
+          f"轮到 {result.turn}，血量条 {result.hp_bar}，画面倍率 {result.multiplier}")
     if result.last_move:
         move = result.last_move
         print('上一步：' + (f"翻子 {move['to']}" if move['from'] is None else f"{move['from']} → {move['to']}"))

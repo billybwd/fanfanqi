@@ -32,7 +32,7 @@ import numpy as np
 from PIL import Image
 
 from fanfanqi.vision import (
-    COLS, OCCUPIED_EDGE, PANEL_LIT, ROWS, TEMPLATE_PATH, badge_present, badge_tile, button_tile, cell_patch,
+    COLS, OCCUPIED_TEXTURE, PANEL_LIT, ROWS, TEMPLATE_PATH, badge_present, badge_tile, button_tile, cell_patch,
     cell_signals, cell_tile, glyph, glyph_key, locate_board, normalize_label, panel_slots, slot_brightness,
     to_rgb,
 )
@@ -57,7 +57,7 @@ def collect(folder, kind):
         if kind == 'cell':
             for row in range(ROWS):
                 for col in range(COLS):
-                    if cell_signals(cell_patch(rgb, layout, row, col), layout)['edge'] >= OCCUPIED_EDGE:
+                    if cell_signals(cell_patch(rgb, layout, row, col), layout)['texture'] < OCCUPIED_TEXTURE:
                         continue  # 空格
                     tiles.append(cell_tile(rgb, layout, row, col))
                     sources.append([name, row, col])

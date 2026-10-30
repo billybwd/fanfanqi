@@ -420,6 +420,7 @@ type Searcher struct {
 	// Search extensions (search_ext): killer moves, principal variation search and late move reductions.
 	Ext bool
 	LmrDepth, LmrMoves int
+	StarMargin float64 // chance-node pruning margin (see chance); < 0 disables
 	killers [maxPly][2]Move
 	OnDepth func(best Move,value float64,depth int) // called after each completed iteration
 	bufs [maxPly]plyBuf
@@ -437,11 +438,14 @@ type timeoutPanic struct{}
 type ttSlot struct { check, value, meta atomic.Uint64 }
 type TransTable struct { slots []ttSlot; mask uint64; gen atomic.Uint64 }
 
+func clampTTBits(bits int) int { if bits < 10 { return 10 }; if bits > 26 { return 26 }; return bits }
 func newTransTable(bits int) *TransTable {
-	if bits < 10 { bits = 10 } else if bits > 26 { bits = 26 }
+	bits = clampTTBits(bits)
 	return &TransTable{slots: make([]ttSlot, 1<<bits), mask: uint64(1<<(bits-1) - 1)}
 }
 func (t *TransTable) nextGeneration() { t.gen.Add(1) }
+// reset empties the table in place, so an evicted table's memory is reused instead of allocating a new one.
+func (t *TransTable) reset() { clear(t.slots); t.gen.Store(0) }
 func (t *TransTable) read(slot *ttSlot) (key, v, m uint64) {
 	check, v, m := slot.check.Load(), slot.value.Load(), slot.meta.Load()
 	return check ^ v ^ m, v, m
@@ -477,7 +481,7 @@ func number(v any, fallback float64) float64 { if n,ok:=v.(float64); ok{return n
 func intParam(p map[string]any,key string,fallback int) int { return int(number(p[key],float64(fallback))) }
 func floatParam(p map[string]any,key string,fallback float64) float64 { return number(p[key],fallback) }
 func weightMap(p map[string]any) map[string]any { if w,ok:=p["weights"].(map[string]any);ok{return w};return nil }
-func defaultParams() map[string]any { return map[string]any{"multiplier_exponent":1.0,"loss_aversion":1.0,"win_temperature":12.0,"max_depth":20,"root_flips":8,"node_flips":3,"node_quiet_moves":10,"qsearch_depth":4,"full_chance_plies":1,"q_hidden_caps":1,"q_hidden_depth":0,"delta_margin":6.0,"eval_cache_size":200000,"cannon_endgame_value":2.0,"time_check_interval":32,"early_pool_threshold":20,"mid_pool_threshold":12,"early_root_flips":6,"mid_root_flips":7,"early_node_flips":2,"mid_node_flips":3,"early_chance_samples":6,"mid_chance_samples":8,"tt_bits":21,"keep_tt":1,"search_ext":1,"lmr_min_depth":3,"lmr_moves":3} }
+func defaultParams() map[string]any { return map[string]any{"multiplier_exponent":1.0,"loss_aversion":1.0,"win_temperature":12.0,"max_depth":20,"root_flips":8,"node_flips":3,"node_quiet_moves":10,"qsearch_depth":4,"full_chance_plies":1,"q_hidden_caps":1,"q_hidden_depth":0,"delta_margin":6.0,"eval_cache_size":200000,"cannon_endgame_value":2.0,"time_check_interval":32,"early_pool_threshold":20,"mid_pool_threshold":12,"early_root_flips":6,"mid_root_flips":7,"early_node_flips":2,"mid_node_flips":3,"early_chance_samples":6,"mid_chance_samples":8,"tt_bits":21,"keep_tt":1,"search_ext":1,"lmr_min_depth":3,"lmr_moves":3,"star_margin":-1.0} }
 func makeSearcher(params map[string]any,strategy int,deadline time.Time,tt *TransTable,stop *atomic.Bool) *Searcher {
 	d:=defaultParams(); for k,v:=range params {d[k]=v}; p:=d
 	wm:=weightMap(p); nested:=map[string]any{}; if raw,ok:=wm["piece_value"].(map[string]any);ok{nested=raw}
@@ -495,6 +499,7 @@ func makeSearcher(params map[string]any,strategy int,deadline time.Time,tt *Tran
 	s.EarlyRootFlips,s.MidRootFlips,s.EarlyNodeFlips,s.MidNodeFlips=intParam(p,"early_root_flips",6),intParam(p,"mid_root_flips",7),intParam(p,"early_node_flips",2),intParam(p,"mid_node_flips",3)
 	s.EarlyChance,s.MidChance=intParam(p,"early_chance_samples",6),intParam(p,"mid_chance_samples",8)
 	s.Ext,s.LmrDepth,s.LmrMoves=intParam(p,"search_ext",1)!=0,intParam(p,"lmr_min_depth",3),intParam(p,"lmr_moves",3)
+	s.StarMargin=floatParam(p,"star_margin",-1)
 	return s
 }
 func (s *Searcher) buf(ply int) *plyBuf { if ply<maxPly {return &s.bufs[ply]}; return &plyBuf{} }
@@ -587,7 +592,39 @@ func (s *Searcher) chanceWeights(p *Position) (w [15]float64) {
 func (s *Searcher) child(p *Position,m Move,depth int,alpha,beta float64,ply int) float64 {
 	if m.Kind==moveKind||m.Kind==captureKind{u:=p.doMove(m.A,m.C);v:=-s.negamax(p,depth-1,-beta,-alpha,ply+1);p.undo(u);return v}
 	if m.Kind==flipKind&&ply>=s.FullChancePlies{u:=p.doFlipApprox(m.A);v:=-s.negamax(p,depth-1,-beta,-alpha,ply+1);p.undo(u);return v}
-	weights:=s.chanceWeights(p);value:=0.0;for code:=1;code<=14;code++{prob:=weights[code];if prob<=0{continue};var u Undo;if m.Kind==flipKind{u=p.doFlip(m.A,code)}else{u=p.doHiddenCapture(m.A,m.C,code)};v:=-s.negamax(p,depth-1,math.Inf(-1),math.Inf(1),ply+1);p.undo(u);value+=prob*v};return value
+	return s.chance(p,m,depth,alpha,beta,ply)
+}
+// applyOutcome reveals code at a chance move: a flip, or a cannon capturing a hidden piece.
+func (p *Position) applyOutcome(m Move,code int) Undo { if m.Kind==flipKind{return p.doFlip(m.A,code)}; return p.doHiddenCapture(m.A,m.C,code) }
+// chance is the expectation over the revealed piece. With star_margin < 0 every outcome gets a full window.
+// Otherwise (Star1 with probed bounds, cf. Ballard's *-minimax) each outcome is first probed with a static
+// evaluation v̂ and assumed to lie in v̂ ± star_margin × M^λ (M = that outcome's multiplier, i.e. the scale
+// of its values). Outcomes are searched most probable first, each with the window that would still let the
+// expectation land in (alpha, beta) given the bounds of the rest; once the expectation is certain to fall
+// outside the window the remaining outcomes are skipped. The bounds are heuristic, so this can misjudge a
+// node whose deep value strays far from its static evaluation; the margin trades that risk against speed.
+func (s *Searcher) chance(p *Position,m Move,depth int,alpha,beta float64,ply int) float64 {
+	weights:=s.chanceWeights(p)
+	if s.StarMargin<0{value:=0.0;for code:=1;code<=14;code++{prob:=weights[code];if prob<=0{continue};u:=p.applyOutcome(m,code);v:=-s.negamax(p,depth-1,math.Inf(-1),math.Inf(1),ply+1);p.undo(u);value+=prob*v};return value}
+	type outcome struct{code int;prob,lo,hi float64}
+	var outs [14]outcome;n:=0;lo,hi:=0.0,0.0
+	for code:=1;code<=14;code++{
+		prob:=weights[code];if prob<=0{continue}
+		u:=p.applyOutcome(m,code);est:=0.0
+		if p.NoCapturePlies>=p.NoCaptureLimit{est=0}else if p.Winner>=0{est=-s.terminalValue(p,ply+1)}else{est=-s.leafValue(p)}
+		margin:=s.StarMargin*math.Pow(s.estMultiplier(p),s.Lam)*math.Max(1,s.Kappa);p.undo(u)
+		outs[n]=outcome{code,prob,est-margin,est+margin};n++;lo+=prob*(est-margin);hi+=prob*(est+margin)
+	}
+	for i:=1;i<n;i++{x:=outs[i];j:=i;for j>0&&outs[j-1].prob<x.prob{outs[j]=outs[j-1];j--};outs[j]=x}
+	sum:=0.0
+	for _,o:=range outs[:n]{
+		restLo,restHi:=lo-o.prob*o.lo,hi-o.prob*o.hi
+		a,b:=(alpha-sum-restHi)/o.prob,(beta-sum-restLo)/o.prob
+		u:=p.applyOutcome(m,o.code);v:=-s.negamax(p,depth-1,-b,-a,ply+1);p.undo(u)
+		sum+=o.prob*v;lo,hi=restLo,restHi
+		if sum+hi<=alpha{return sum+hi};if sum+lo>=beta{return sum+lo}
+	}
+	return sum
 }
 func poolSize(p *Position)int{n:=0;for _,v:=range p.Pool{n+=v};return n}
 
@@ -669,7 +706,12 @@ func tableFor(req Request,strategy int) *TransTable {
 	params:=defaultParams();for k,v:=range req.Params{params[k]=v};if intParam(params,"keep_tt",1)==0{return nil}
 	raw,_:=json.Marshal(params);key:=fmt.Sprint(strategy)+string(raw)
 	for i,t:=range keptTables{if t.key==key{keptTables=append(append([]keptTable{t},keptTables[:i]...),keptTables[i+1:]...);return t.tt}}
-	t:=keptTable{key,newTransTable(intParam(params,"tt_bits",21))};keptTables=append([]keptTable{t},keptTables...);if len(keptTables)>3{keptTables=keptTables[:3]};return t.tt
+	// A new parameter set (e.g. every game while tuning): once three tables are kept, reuse the least recently
+	// used one's memory instead of allocating another and leaving the old ones to the garbage collector.
+	bits:=clampTTBits(intParam(params,"tt_bits",21));var tt *TransTable
+	if len(keptTables)>=3{last:=keptTables[len(keptTables)-1];keptTables=keptTables[:len(keptTables)-1];if len(last.tt.slots)==1<<bits{tt=last.tt;tt.reset()}}
+	if tt==nil{tt=newTransTable(bits)}
+	keptTables=append([]keptTable{{key,tt}},keptTables...);return tt
 }
 func choose(p Position,req Request,emit func(any),stop *atomic.Bool)(map[string]any,map[string]any){
 	if p.NoCapturePlies >= p.NoCaptureLimit { return nil, map[string]any{"source":"rules","draw":true,"no_capture_plies":p.NoCapturePlies} }
@@ -706,8 +748,9 @@ func main(){
 	start:=func(req Request){
 		stop:=&atomic.Bool{};running=stop
 		go func(){
-			// Safety net: if a request overruns its budget by 3s, report every goroutine stack and exit instead of hanging.
-			watchdog:=time.AfterFunc(time.Duration(max(1,req.TimeBudgetMS)+3000)*time.Millisecond,func(){buf:=make([]byte,1<<20);n:=runtime.Stack(buf,true);fmt.Fprintf(os.Stderr,"engine watchdog: search exceeded its time budget by 3s\n%s",buf[:n]);os.Exit(3)})
+			// Safety net: if a request overruns its budget by 10s, report every goroutine stack and exit instead of hanging.
+			// (3s was too tight on a loaded machine: allocating or clearing a large table can stall while memory pages.)
+			watchdog:=time.AfterFunc(time.Duration(max(1,req.TimeBudgetMS)+10000)*time.Millisecond,func(){buf:=make([]byte,1<<20);n:=runtime.Stack(buf,true);fmt.Fprintf(os.Stderr,"engine watchdog: search exceeded its time budget by 10s\n%s",buf[:n]);os.Exit(3)})
 			resp:=handle(req,emit,stop);watchdog.Stop();emit(resp);done<-struct{}{}
 		}()
 	}

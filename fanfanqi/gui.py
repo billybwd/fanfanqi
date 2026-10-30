@@ -126,6 +126,7 @@ class App:
         # 画面同步（录入模式）：后台线程截屏识别，结果经队列交给界面线程
         self.sync_watcher = None
         self.board_sync = None
+        self.screen_multiplier = None  # 同步时最近一次识别到的画面倍率（认不出为 None）
         self.sync_synced = False
         self.sync_queue = queue.Queue()
 
@@ -140,6 +141,7 @@ class App:
         self.no_capture_var = tk.IntVar(value=max(1, int(rules.get('no_capture_limit', DEFAULT_NO_CAPTURE_LIMIT))))
         self.budget_var = tk.DoubleVar(value=cfg['think_time_sec'])
         self.ai_budget_var = tk.DoubleVar(value=cfg['ai_think_time_sec'])
+        self.win_now_var = tk.IntVar(value=cfg['win_now_multiplier'])
         self.hint_depth_var = tk.IntVar(value=max(0, int(cfg['hint_min_depth'])))
         self.hint_side_var = tk.StringVar(value=HINT_SIDE_LABELS.get(cfg['hint_side'], '双方'))
         self.show_on_board_var = tk.BooleanVar(value=cfg['show_hint_on_board'])
@@ -237,7 +239,26 @@ class App:
         cfg['hint_side'] = _key_of(HINT_SIDE_LABELS, self.hint_side_var.get())
         cfg['show_hint_on_board'] = bool(self.show_on_board_var.get())
         cfg['ponder'] = bool(self.ponder_var.get())
+        cfg['win_now_multiplier'] = self.win_now_multiplier()
         save_config(cfg)
+
+    def win_now_multiplier(self):
+        try:
+            return max(0, int(self.win_now_var.get()))
+        except (tk.TclError, ValueError):
+            return 0
+
+    def current_multiplier(self, game):
+        """判断求胜倍率用的倍率：同步时优先用画面上识别到的倍率（含抢红/加倍系数）；
+        认不出或没在同步时，用程序算的基础倍率（不含抢红/加倍系数）。返回 (倍率, 来源)。"""
+        if self.syncing and self.screen_multiplier:
+            return self.screen_multiplier, '画面'
+        return game.get_multiplier()['multiplier'], '基础'
+
+    def winning_now(self, game):
+        """倍率达到「求胜倍率」：提示和电脑走子都只求胜。"""
+        threshold = self.win_now_multiplier()
+        return threshold > 0 and self.current_multiplier(game)[0] >= threshold
 
     def on_setting_changed(self, _event=None):
         self.save_settings()
@@ -432,6 +453,7 @@ class App:
                                 state='readonly', width=5)
         side_box.bind('<<ComboboxSelected>>', self.on_setting_changed)
         setting('提示方', side_box)
+        setting('求胜倍率', spinbox(self.win_now_var, 0, 100000, 50, self.on_setting_changed))
         ttk.Checkbutton(cfg, text='在棋盘上标出提示', variable=self.show_on_board_var,
                         command=lambda: (self.save_settings(), self.draw_board())).grid(
             row=row, column=0, columnspan=2, sticky='w', pady=(2, 0))
@@ -441,7 +463,8 @@ class App:
         wrapped(cfg_tab, text='自动保存到 config.json。提示时间：给提示的思考时间；起始层数：V16/V17 搜到这一层就先给提示，'
                               '之后随深度更新（0 = 只给最终结果）；和棋步数：连续未吃子的普通移子数；'
                               '电脑时间只用于人机对战。思考时间对 V15~V17 生效。'
-                              '提前计算：不需要提示的一方行动时，Go 引擎在后台先算，轮到自己时提示更快更深。',
+                              '提前计算：不需要提示的一方行动时，Go 引擎在后台先算，轮到自己时提示更快更深。'
+                              '求胜倍率：画面倍率达到这个值后，提示和电脑走子都只求胜、不再为扩大倍率冒险（0 = 关闭）。',
                 foreground='#888888').pack(anchor='w', pady=(6, 0))
         self.update_engine_widgets()
 
@@ -678,7 +701,14 @@ class App:
         self.pool_var.set('\n'.join(counts))
 
         m = g.get_multiplier()
-        self.mult_var.set(f"{m['multiplier']} = 连击 {m['combo_factor']} ×（翻棋 {m['flip_score']} + 血差 {m['hp_diff']}）")
+        text = f"{m['multiplier']} = 连击 {m['combo_factor']} ×（翻棋 {m['flip_score']} + 血差 {m['hp_diff']}）"
+        factor = self.board_sync.room_factor if self.syncing and self.board_sync else None
+        if factor and factor > 1:  # 画面倍率还乘了抢红/加倍的系数（对走法没有影响）
+            text = f"{factor * m['multiplier']} = 系数 {factor} × " + text.split(' = ', 1)[1]
+        if self.winning_now(g):
+            value, source = self.current_multiplier(g)
+            text += f'\n{source}倍率 {value} 已达求胜倍率 {self.win_now_multiplier()}：只求胜'
+        self.mult_var.set(text)
         # 每段达到 3 次的连击都累计；当前连击段达到 3 次后实时计入。
         counted = [f"{'红' if s == 'red' else '黑'}方 {m['combo_points'][s]} 分"
                    for s in ('red', 'black') if m['combo_points'][s] > 0]
@@ -720,6 +750,10 @@ class App:
             search = dict(self.config['search'])
             v16_params = self.config['v16']
             v17_params = self.config['v17']
+            if self.winning_now(g):
+                # 倍率已够大：只看胜率（λ = 0），先把这局赢下来（提示和人机对战的电脑都按此走）
+                v16_params = {**v16_params, 'multiplier_exponent': 0.0}
+                v17_params = {**v17_params, 'multiplier_exponent': 0.0}
             engine = 'go' if self.engine_var.get() == 'Go' else 'python'
             try:
                 threads = min(64, max(1, int(self.threads_var.get())))
@@ -1071,6 +1105,7 @@ class App:
             self.sync_queue.get_nowait()
         self.sync_btn.configure(text='开始同步')
         self.sync_status_var.set('已停止同步；可以继续手动录入')
+        self.screen_multiplier = None
         self.request_ai()
         self.refresh()
 
@@ -1087,7 +1122,13 @@ class App:
 
     def apply_sync(self, rec):
         update = self.board_sync.update(rec, self.game if self.sync_synced else None)
-        if update.kind in ('step', 'turn', 'new', 'import'):
+        was_winning = self.winning_now(self.game)
+        if update.kind != 'skip':  # 与同步到的局面同一帧的画面倍率
+            self.screen_multiplier = rec.multiplier
+        if update.kind == 'same' and self.winning_now(self.game) != was_winning:
+            self.request_ai()  # 局面没变但画面倍率越过了求胜倍率：按新目标重新算
+            self.refresh()
+        if update.kind in ('step', 'turn', 'adjust', 'new', 'import'):
             self.sync_synced = True
             self.game = update.game
             if update.kind in ('new', 'import'):

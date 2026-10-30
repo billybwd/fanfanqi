@@ -14,14 +14,55 @@
 import threading
 import time
 from dataclasses import dataclass, field
+from itertools import combinations_with_replacement
 
 import numpy as np
 
 from .advisor import describe_last_action
-from .game import COMBO_THRESHOLD, PIECE_CONFIG, ROWS, COLS, SIDE_NAMES, Game, other_side
+from .game import COMBO_THRESHOLD, FLIP_SCORE, PIECE_CONFIG, ROWS, COLS, SIDE_NAMES, Game, other_side
 from .state import captured_pieces, game_from_state
 
 TURN_LAG_SEC = 1.5  # 走子后这段时间内画面上的轮次可能还没切换
+ROOM_FACTORS = (1, 2, 4)  # 画面倍率额外乘的系数：抢红 ×2、加倍 ×2，都有 ×4
+# 开局 4 个明子的翻棋分之和可能的取值（导入局面时翻棋分未知，在其中找）
+FLIP_SCORES = sorted({sum(FLIP_SCORE[t] for t in combo)
+                      for combo in combinations_with_replacement(PIECE_CONFIG, 4)
+                      if all(combo.count(t) <= 2 * PIECE_CONFIG[t]['count'] for t in combo)})
+
+
+def _combo_points(game, extra=0):
+    """连击系数：已结束的达标连击分（加上 extra）+ 正在进行的 ≥3 连击；都没有时为 1。"""
+    banked = sum(game.combo_score.values()) + extra
+    active = sum(n for n in game.combo.values() if n >= COMBO_THRESHOLD)
+    return banked, active, (banked + active) or 1
+
+
+def multiplier_candidates(shown, game, factors, flips, extras=None):
+    """满足 画面倍率 = F × 连击系数 × (翻棋分 + 血量差) 的候选 {(F, 翻棋分, 额外连击分)}。
+
+    额外连击分是对局里没记到的已结束连击分（中途导入时之前的连击、或漏看的连击），加在双方已结束连击分之和上；
+    已结束连击分之和只能是 0 或 ≥3。extras 给出时只检验这些取值，否则由画面倍率算出。"""
+    hp_diff = game.get_multiplier()['hp_diff']
+    banked0, active, _ = _combo_points(game)
+    found = set()
+    for f in factors:
+        for flip in flips:
+            base = f * (flip + hp_diff)
+            if base <= 0 or shown % base:
+                continue
+            c = shown // base
+            if c == 1:
+                if active:
+                    continue
+                extra = -banked0
+            else:
+                extra = c - active - banked0
+            banked = banked0 + extra
+            if banked < 0 or 0 < banked < COMBO_THRESHOLD:
+                continue
+            if extras is None or extra in extras:
+                found.add((f, flip, extra))
+    return found
 
 
 def board_tokens(game):
@@ -53,7 +94,7 @@ def _matches(game, tokens, captured):
 
 @dataclass
 class SyncUpdate:
-    kind: str                      # 'same' 未变 | 'turn' 只改了轮次 | 'step' 按动作推进 | 'new' 新开一局 | 'import' 整体导入 | 'skip' 本次不同步
+    kind: str                      # 'same' 未变 | 'turn' 只改了轮次 | 'adjust' 按画面倍率改了翻棋分/连击 | 'step' 按动作推进 | 'new' 新开一局 | 'import' 整体导入 | 'skip' 本次不同步
     game: Game = None
     log: list = field(default_factory=list)   # 新增的棋谱行（'new' / 'import' 时是整局重新开始的棋谱）
     message: str = ''
@@ -63,12 +104,78 @@ class BoardSync:
     def __init__(self, rules=None):
         self.rules = dict(rules or {})
         self.my_side = None        # 下方玩家（自己）执哪一方，本局内记住（连击特效时可能暂时认不出）
+        self.room_factor = None    # 画面倍率的额外系数 F（抢红/加倍），从画面倍率反推，本局内记住
+        self.trusted = False       # 对局里的翻棋分、连击是否可信（按开局重建的可信；整体导入的要靠画面倍率反推）
+        self._candidates = None    # 画面倍率的候选解 {(F, 翻棋分, 额外连击分)}，跨帧取交集
+        self._flip_hint = None     # 本局已确定的翻棋分（整体导入时沿用）
         self._last_step = 0.0
 
     def _new_game(self):
         return Game(**{k: v for k, v in self.rules.items() if k in ('long_chase_limit', 'no_capture_limit')})
 
     def update(self, rec, game, now=None):
+        result = self._update(rec, game, now)
+        if result.kind in ('new', 'import'):
+            # 新对局：F 重新认；按开局重建的翻棋分、连击可信，整体导入的要靠画面倍率反推。
+            # 同一局里漏看几步而整体导入时，之前确定的 F 和翻棋分整局不变，优先沿用（对不上画面时再全面找）
+            if result.kind == 'new':
+                self.room_factor, self._flip_hint = None, result.game.flip_score
+            self.trusted, self._candidates = result.kind == 'new', None
+        if result.kind != 'skip' and rec.multiplier:
+            self._reconcile(result, rec.multiplier)
+        return result
+
+    def _reconcile(self, result, shown):
+        """按画面倍率反推系数 F、翻棋分和没记到的连击分。F、开局翻棋分、导入前的连击分整局不变，
+        所以候选解跨帧取交集（中途导入时单看一帧常有几组解，血量差变化后会收敛），所有候选一致的部分才采用。"""
+        game = result.game
+        started = len(game.remaining_pool) < 32 - len(game.setup_positions)  # 开局 4 子之外翻过子
+        factors = [self.room_factor] if self.room_factor and started else list(ROOM_FACTORS)
+        candidates = set()
+        if self._candidates:
+            candidates = {c for c in self._candidates if c[0] in factors and
+                          c in multiplier_candidates(shown, game, [c[0]], [c[1]], [c[2]])}
+        if not candidates and self.trusted:  # 翻棋分、连击都可信时只有 F 未知
+            candidates = multiplier_candidates(shown, game, factors, [game.flip_score], [0])
+        if not candidates and self.trusted:  # 对局里的连击和画面不符（漏看等）：翻棋分仍可信
+            candidates = multiplier_candidates(shown, game, factors, [game.flip_score])
+        if not candidates and self._flip_hint is not None:
+            candidates = multiplier_candidates(shown, game, factors, [self._flip_hint])
+        if not candidates:
+            candidates = multiplier_candidates(shown, game, factors, FLIP_SCORES)
+        self._candidates = candidates or None
+        if not candidates:
+            return
+
+        factors, flips, extras = ({c[i] for c in candidates} for i in range(3))
+        notes = []
+        if len(factors) == 1 and self.room_factor != next(iter(factors)):
+            self.room_factor = next(iter(factors))
+            notes.append(f'倍率系数 ×{self.room_factor}')
+        changed = game.clone() if result.kind == 'same' else game
+        before = changed.get_multiplier()
+        if len(flips) == 1 and changed.flip_score != next(iter(flips)):
+            changed.flip_score = next(iter(flips))
+            notes.append(f"翻棋分 {before['flip_score']} → {changed.flip_score}")
+        if len(extras) == 1 and next(iter(extras)):
+            extra = next(iter(extras))
+            # 连击系数只看双方已结束连击分之和，记在原来分数多的一方
+            side = 'red' if changed.combo_score['red'] >= changed.combo_score['black'] else 'black'
+            changed.combo_score = {side: sum(changed.combo_score.values()) + extra, other_side(side): 0}
+            self._candidates = {(f, flip, x - extra) for f, flip, x in candidates}
+            notes.append(f"连击系数 {before['combo_factor']} → {changed.get_multiplier()['combo_factor']}")
+        if len(flips) == 1:
+            self._flip_hint = next(iter(flips))
+        if len(flips) == 1 and len(extras) == 1:
+            self.trusted = True
+        if not notes:
+            return
+        changed.history[-1] = changed.create_snapshot()
+        if result.kind == 'same' and changed.create_snapshot() != game.create_snapshot():
+            result.kind, result.game = 'adjust', changed
+        result.message = '；'.join(m for m in (result.message, f"按画面倍率 {shown}：{'，'.join(notes)}") if m)
+
+    def _update(self, rec, game, now=None):
         now = time.monotonic() if now is None else now
         if rec.game_over:
             return SyncUpdate('skip', message='对局已结束（画面上出现「开始」按钮）')
@@ -231,7 +338,7 @@ def _signature(rgb, layout):
 
 def _key(rec):
     return (tuple(tuple(r) for r in rec.board), repr(sorted((s, sorted(p.items())) for s, p in rec.captured.items())),
-            rec.turn, rec.turn_certain, rec.my_side, rec.game_over, bool(rec.problems))
+            rec.turn, rec.turn_certain, rec.my_side, rec.game_over, bool(rec.problems), rec.multiplier)
 
 
 class ScreenWatcher(threading.Thread):

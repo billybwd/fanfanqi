@@ -302,6 +302,54 @@ def sync_tests(check, vision):
           lagging.kind == 'same' and corrected.kind == 'turn' and corrected.game.current_turn == other
           and uncertain.kind == 'same')
 
+    # 画面倍率 = F × 倍率：从开局跟踪时反推出 F，且不会把逐步推进得到的翻棋分/连击改错
+    def with_mult(rec, game, factor):
+        rec.multiplier = factor * game.get_multiplier()['multiplier']
+        return rec
+
+    ok, combos = True, 0
+    for i in range(6):
+        factor = (1, 2, 4)[i % 3]
+        real = Game()
+        random_setup(real)
+        sync, mine = BoardSync(), None
+        for step in range(150):
+            if real.phase != 'playing':
+                break
+            update = sync.update(with_mult(rec_of(real), real, factor), mine, now=2.0 * step)
+            mine = update.game or mine
+            ok = ok and fields(mine) == fields(real) and sync.room_factor == factor
+            combos += real.get_multiplier()['combo_factor'] > 1
+            apply_real(real, rng.choice(real.get_all_actions()))
+    check(f'画面倍率：开局反推系数 F，跟踪中不误改翻棋分/连击（{combos} 步带连击）', ok)
+
+    # 中途导入：翻棋分、连击按 0 导入，候选解跨帧取交集，收敛到唯一解时补上；补上的值不能错
+    solved = wrong = total = 0
+    for i in range(30):
+        factor = (1, 2, 4)[i % 3]
+        real = Game()
+        random_setup(real)
+        for _ in range(rng.randrange(20, 60)):
+            if real.phase != 'playing':
+                break
+            apply_real(real, rng.choice(real.get_all_actions()))
+        if real.phase != 'playing':
+            continue
+        sync, mine, total = BoardSync(), None, total + 1
+        for step in range(40):
+            if real.phase != 'playing':
+                break
+            update = sync.update(with_mult(rec_of(real), real, factor), mine, now=2.0 * step)
+            mine = update.game or mine
+            apply_real(real, rng.choice(real.get_all_actions()))
+        shown = factor * real.get_multiplier()['multiplier']
+        if sync.room_factor not in (None, factor) or mine.flip_score not in (0, real.flip_score):
+            wrong += 1
+        elif sync.trusted and sync.room_factor == factor:
+            ok_now = mine.get_multiplier()['multiplier'] * factor == shown or real.phase != 'playing'
+            solved += mine.flip_score == real.flip_score and ok_now
+    check(f'画面倍率：中途导入后跨帧反推，{solved}/{total} 局完全还原 F 和翻棋分，没有解错', wrong == 0)
+
 
 if __name__ == '__main__':
     if len(sys.argv) > 5:
