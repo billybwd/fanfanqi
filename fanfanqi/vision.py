@@ -15,9 +15,11 @@ game_from_state() 校验（明子 + 被吃 ≤ 总数、暗子数 = 剩余池、
 """
 
 import argparse
+from functools import lru_cache
 from itertools import product
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -47,6 +49,7 @@ _ALIASES = {'帅': '将', '帥': '将', '將': '将', '相': '象', '士': '仕'
 # 被吃子栏：(栏, 类型顺序, 列中心, 第一个图标的行中心)，图标间隔 0.6 格
 PANELS = (('left', '将仕象车马炮兵', -0.95, 1.57), ('right', '兵炮马车象仕将', 5.0, 2.79))
 PANEL_STEP = 0.6
+PANEL_INK = 0.22   # 判断被吃子栏图标红黑时取样的范围（格）：只看中心字迹，避开左下角的红色印章
 # 玩家信息：头像中心与边长、血量条图标中心、血量条满血时右端
 PLAYERS = {
     'top': {'avatar': (-2.75, 0.2, 1.1), 'icon': (-3.1, 0.93), 'bar_row': 0.93, 'bar_span': (-3.4, -0.5), 'bar_full': -0.705},
@@ -58,6 +61,8 @@ MULT_ROWS = (-0.42, -0.06)
 MULT_COLS = (4.6, 10.0)
 DIGIT_SIZE = (12, 20)  # 倍率数字图块（宽、高）
 DIGIT_MAX = 0.6        # 数字字形距离超过此值认为没把握，不读倍率
+# 同步时找到棋盘后只截这一块（格，左、上、右、下）：两侧被吃子栏、头像和血量条、右上角倍率框都在里面
+WATCH_REGION = (-4.0, -0.8, MULT_COLS[1], 9.2)
 
 
 @dataclass
@@ -203,8 +208,10 @@ def cell_tile(rgb, layout, row, col, inner=0.62):
 
 
 GLYPH_RETRY = 0.45  # 距离超过此值时在附近微调取样位置再匹配
-# 第一轮：定位差一两个像素；第二轮：选中后抬起放大的棋子（约 1.08 倍、上下偏 0.1 格左右）
-NEAR_OFFSETS = [(dx, dy, 0.62) for dy in (-0.04, -0.02, 0.0, 0.02, 0.04) for dx in (-0.04, -0.02, 0.0, 0.02, 0.04)]
+# 第一轮：定位差一两个像素，以及上一步落点（带金色光圈）的棋子画得偏下约 0.08 格；
+# 第二轮：选中后抬起放大的棋子（约 1.08 倍、上下偏 0.1 格左右）
+NEAR_OFFSETS = [(dx, dy, 0.62) for dy in (-0.08, -0.06, -0.04, -0.02, 0.0, 0.02, 0.04, 0.06, 0.08)
+                for dx in (-0.04, -0.02, 0.0, 0.02, 0.04)]
 LIFTED_OFFSETS = [(dx, round(dy, 2), inner) for inner in (0.67, 0.72) for dy in np.arange(-0.15, 0.16, 0.03)
                   for dx in (-0.06, -0.03, 0.0, 0.03, 0.06)]
 
@@ -213,8 +220,15 @@ def _erase_dot(patch, cell, dx=0.0, dy=0.0):
     """暗子正中的绿色小圆点（对方选中/悬停的标记）用周围的颜色盖掉，免得字形对不上。
     (dx, dy) 是取样框相对格子中心的偏移，圆点在取样框里的位置要反向挪。"""
     h, w = patch.shape[:2]
+    cy, cx = (h - 1) / 2 - dy * cell, (w - 1) / 2 - dx * cell
+    # 先只看圆点中心附近几个像素，没有绿色就直接返回（绝大多数格子），不必算整张距离图
+    r = max(1, int(0.05 * cell))
+    y, x = int(round(cy)), int(round(cx))
+    core = patch[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1].astype(np.int16)
+    if not core.size or float((core[..., 1] - core[..., 0]).mean()) < GREEN_DOT:
+        return patch
     yy, xx = np.mgrid[0:h, 0:w]
-    d = np.hypot(xx - ((w - 1) / 2 - dx * cell), yy - ((h - 1) / 2 - dy * cell)) / cell
+    d = np.hypot(xx - cx, yy - cy) / cell
     center = patch[d < 0.05].astype(np.int16)
     if not len(center) or float((center[:, 1] - center[:, 0]).mean()) < GREEN_DOT:
         return patch
@@ -246,11 +260,17 @@ def cell_patch(rgb, layout, row, col):
 
 
 def _ring_mask(shape, cell, r0, r1):
-    """以区域中心为圆心、半径 r0~r1 格的环形区域。"""
-    h, w = shape[:2]
+    """以区域中心为圆心、半径 r0~r1 格的环形区域（按尺寸缓存：同一窗口里每格都一样）。"""
+    return _ring_mask_cached(shape[0], shape[1], round(float(cell), 3), r0, r1)
+
+
+@lru_cache(maxsize=256)
+def _ring_mask_cached(h, w, cell, r0, r1):
     yy, xx = np.mgrid[0:h, 0:w]
     d = np.hypot(xx - (w - 1) / 2, yy - (h - 1) / 2) / cell
-    return (d >= r0) & (d < r1)
+    mask = (d >= r0) & (d < r1)
+    mask.flags.writeable = False
+    return mask
 
 
 def cell_signals(patch, layout):
@@ -279,10 +299,15 @@ def glyph(tile):
     return g / (g.std() + 1e-6)
 
 
-def ink_redness(tile):
-    """字迹像素的 r − g：红字约 50 以上，黑字 20 以下；没有字迹（暗子）时返回 None。"""
+def ink_redness(tile, relative=False):
+    """字迹像素的 r − g：红字约 50 以上，黑字 20 以下；没有字迹（暗子）时返回 None。
+    relative：棋子发光（炮吃子后的金光）时字迹被照亮到 150~180，绝对阈值找不到字迹，改取比中位亮度暗 50 以上
+    的像素（实测发光的红炮 r − g 约 75~84、黑炮约 20）。只用于棋盘上已认出字形的棋子。"""
     t = tile.astype(np.int16)
-    ink = t.mean(axis=2) < 120
+    gray = t.mean(axis=2)
+    ink = gray < 120
+    if ink.sum() < 8 and relative:
+        ink = gray < np.median(gray) - 50
     if ink.sum() < 8:
         return None
     return float((t[..., 0] - t[..., 1])[ink].mean())
@@ -575,6 +600,52 @@ def _turn_frame(rgb, layout, info):
     return float(((px[:, 1] > 150) & (px[:, 0] < 130) & (px[:, 2] < 130)).mean())
 
 
+def _read_cell(rgb, layout, row, col, templates):
+    """一个格子：有没有子、上一步起点 / 终点标记、字形和红黑。"""
+    signals = cell_signals(cell_patch(rgb, layout, row, col), layout)
+    out = {'token': '.', 'from': False, 'to': False, 'label': None, 'distance': 0.0,
+           'ink_mismatch': False, 'no_ink': False}
+    if signals['texture'] < OCCUPIED_TEXTURE:
+        out['from'] = signals['dot'] >= DOT_MIN
+        return out
+    out['to'] = signals['ring'] >= RING_MIN
+    tile, label, d = _match_cell(rgb, layout, row, col, templates)
+    out['label'], out['distance'] = label, d
+    if label == '?':
+        out['token'] = '?'
+        return out
+    redness = ink_redness(tile, relative=True)
+    ink = None if redness is None else ('r' if redness >= RED_INK else 'b')
+    if label in SHARED_GLYPHS:
+        out['token'] = (ink or 'r') + label
+    else:
+        out['token'] = label
+        out['ink_mismatch'] = ink is not None and ink != label[0]
+    out['no_ink'] = ink is None
+    return out
+
+
+CELL_CACHE_SIZE = 512
+_cell_cache = {}
+
+
+def _read_cell_cached(rgb, layout, row, col, templates):
+    """按格子附近的像素内容缓存识别结果：同步时相邻两帧通常只有一两个格子变了，其余直接复用。
+    键取格子中心 1.3 格见方的像素（覆盖字形匹配时挪动 / 放大取样框的范围）和格子大小、模板。"""
+    patch = layout.crop(rgb, col + 0.5, row + 0.5, 1.3, 1.3)
+    if patch is None:
+        return _read_cell(rgb, layout, row, col, templates)
+    key = (hash(np.ascontiguousarray(patch).tobytes()), patch.shape, round(layout.cell, 3),
+           round(layout.x % 1, 3), round(layout.y % 1, 3), id(templates))
+    hit = _cell_cache.get(key)
+    if hit is None:
+        hit = _read_cell(rgb, layout, row, col, templates)
+        if len(_cell_cache) >= CELL_CACHE_SIZE:
+            _cell_cache.clear()
+        _cell_cache[key] = hit
+    return hit
+
+
 def recognize(image, templates=None, layout=None):
     """识别一张截图。layout 可以传入上一次的结果，省去定位（窗口大小不变时）。"""
     templates = templates or default_templates()
@@ -594,29 +665,19 @@ def recognize(image, templates=None, layout=None):
     for row in range(ROWS):
         tokens = []
         for col in range(COLS):
-            signals = cell_signals(cell_patch(rgb, layout, row, col), layout)
-            if signals['texture'] < OCCUPIED_TEXTURE:
-                tokens.append('.')
-                if signals['dot'] >= DOT_MIN:
-                    froms.append((row, col))
-                continue
-            if signals['ring'] >= RING_MIN:
+            cell = _read_cell_cached(rgb, layout, row, col, templates)
+            if cell['from']:
+                froms.append((row, col))
+            if cell['to']:
                 tos.append((row, col))
-            tile, label, d = _match_cell(rgb, layout, row, col, templates)
-            if label == '?':
-                tokens.append('?')
-            else:
-                redness = ink_redness(tile)
-                ink = None if redness is None else ('r' if redness >= RED_INK else 'b')
-                if label in SHARED_GLYPHS:
-                    side = ink or 'r'
-                    tokens.append(side + label)
-                else:
-                    tokens.append(label)
-                    if ink is not None and ink != label[0]:
-                        result.problems.append(f'第 {row} 行第 {col} 列：字形像「{label}」但字迹颜色不符')
-                if ink is None:
-                    result.problems.append(f'第 {row} 行第 {col} 列：看不清字迹颜色')
+            tokens.append(cell['token'])
+            if cell['token'] == '.':
+                continue
+            label, d = cell['label'], cell['distance']
+            if cell['ink_mismatch']:
+                result.problems.append(f'第 {row} 行第 {col} 列：字形像「{label}」但字迹颜色不符')
+            if cell['no_ink']:
+                result.problems.append(f'第 {row} 行第 {col} 列：看不清字迹颜色')
             occupied += 1
             if d <= GLYPH_MAX:
                 good += 1
@@ -669,13 +730,21 @@ def recognize(image, templates=None, layout=None):
                 if t == '兵':
                     soldier_badges.append(name)
             counts[t] = n
-            k = ink_redness(_resize(layout.crop(rgb, col, row, 0.36, 0.36), (TILE, TILE)))
+            # 只看图标中心的字迹：最近被吃的那种子左下角会多一个红色小印章，取样框大了会把黑字判成红字
+            k = ink_redness(_resize(layout.crop(rgb, col, row, PANEL_INK, PANEL_INK), (TILE, TILE)))
             if k is not None:
                 redness.append(k)
         side = None if not redness else ('red' if np.median(redness) >= RED_INK else 'black')
         columns[name] = (side, counts)
     sides = {name: side for name, (side, _) in columns.items()}
-    if sides['left'] is None and sides['right'] is not None:
+    top, bottom = result.players.get('top'), result.players.get('bottom')
+    if top and bottom and top != bottom:
+        # 左栏总是下方玩家（自己）被吃的子、右栏是上方对手的：认出双方颜色时按位置定，比字迹颜色可靠
+        by_position = {'left': bottom, 'right': top}
+        if any(sides[name] not in (None, by_position[name]) for name in sides):
+            result.notes.append('被吃子栏的字迹颜色与玩家位置不符，按位置（左栏 = 下方玩家）')
+        sides = by_position
+    elif sides['left'] is None and sides['right'] is not None:
         sides['left'] = 'black' if sides['right'] == 'red' else 'red'
     elif sides['right'] is None and sides['left'] is not None:
         sides['right'] = 'black' if sides['left'] == 'red' else 'red'
@@ -760,21 +829,60 @@ def _check(result):
             result.problems.append(f'{name}方血量条约 {shown}，按被吃棋子推算是 {derived}')
 
 
+_mss_local = threading.local()  # mss 的截屏对象不能跨线程用，每个线程一个
+
+
+def _mss():
+    """装了 mss 时返回本线程的截屏对象，否则 None（退回 Pillow）。"""
+    try:
+        import mss
+    except ImportError:
+        return None
+    sct = getattr(_mss_local, 'sct', None)
+    if sct is None:
+        sct = _mss_local.sct = mss.mss()
+    return sct
+
+
+def fast_grab_available():
+    return _mss() is not None
+
+
+def screen_origin():
+    """grab_screen() 整屏图像左上角对应的屏幕坐标（多显示器时可能为负）。"""
+    sct = _mss()
+    if sct is None:
+        return 0, 0
+    return sct.monitors[0]['left'], sct.monitors[0]['top']
+
+
 def grab_screen(bbox=None):
-    """截取屏幕（Windows / macOS）；bbox = (左, 上, 右, 下)。"""
-    from PIL import ImageGrab
-    return ImageGrab.grab(bbox=bbox, all_screens=True)
+    """截取屏幕：bbox = (左, 上, 右, 下) 屏幕坐标，不给时截所有显示器。
+    装了 mss 时用它（只截游戏区域约 15~20ms，比 Pillow 快 5~7 倍），返回 RGB 数组；否则用 Pillow 的 ImageGrab。"""
+    sct = _mss()
+    if sct is None:
+        from PIL import ImageGrab
+        return ImageGrab.grab(bbox=bbox, all_screens=True)
+    region = sct.monitors[0] if bbox is None else \
+        {'left': bbox[0], 'top': bbox[1], 'width': bbox[2] - bbox[0], 'height': bbox[3] - bbox[1]}
+    return np.ascontiguousarray(np.asarray(sct.grab(region))[..., 2::-1])  # BGRA → RGB
 
 
 FAILED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sample_image', 'failed')
 
 
-def save_frame(rgb, layout, problems, directory=FAILED_DIR, limit=200):
+def save_frame(rgb, layout, problems, directory=FAILED_DIR, limit=300):
     """把识别没把握的画面存下来（只截棋盘、被吃子栏和头像一带，不存整个屏幕），附上问题说明，
-    之后可以用 tools/vision_templates.py 补模板。目录里已有 limit 张时不再保存。返回文件路径或 None。"""
+    之后可以用 tools/vision_templates.py 补模板。最多保留 limit 张：满了就删掉最旧的（连同说明），
+    始终保留最近的画面。返回文件路径。"""
     os.makedirs(directory, exist_ok=True)
-    if len([n for n in os.listdir(directory) if n.endswith('.png')]) >= limit:
-        return None
+    frames = sorted(n for n in os.listdir(directory) if n.endswith('.png'))  # 文件名就是时间，按名字排即按时间
+    for name in frames[:max(0, len(frames) - limit + 1)]:
+        for path in (os.path.join(directory, name), os.path.join(directory, name[:-4] + '.txt')):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     (x0, y0), (x1, y1) = layout.point(-3.8, -0.6), layout.point(8.2, 9.0)
     h, w = rgb.shape[:2]
     patch = rgb[max(0, int(y0)):min(h, int(y1)), max(0, int(x0)):min(w, int(x1))]

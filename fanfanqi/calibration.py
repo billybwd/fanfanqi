@@ -64,11 +64,31 @@ def win_prob(info, game, lam=1.0, model=None):
     return probability(model, info['score'], multiplier, game.hp[me] - game.hp[op], hidden_count(game), lam)
 
 
+def opening_red_prob(info, game, lam=1.0, model=None):
+    """开局时红方（先手）的胜率，用开局单独拟合的模型（opening_weights：常数 + 搜索值/倍率^λ）。
+    开局时引擎评估的区分力很弱，结果主要是自对弈里先手的平均胜率。info 站在轮到走的一方（开局是红方）。"""
+    model = model or load()
+    if not model or 'opening_weights' not in model or not info or info.get('score') is None:
+        return None
+    multiplier = info.get('multiplier') or game.get_multiplier()['multiplier']
+    ratio = features(info['score'], multiplier, 0, 28, lam)[1]
+    if game.current_turn != 'red':
+        ratio = -ratio
+    w0, w1 = model['opening_weights']
+    return 1 / (1 + math.exp(-(w0 + w1 * ratio)))
+
+
 def decided(prob, game):
     """当前轮到走的一方是否基本定局（胜率很高，或领先超过一个将）。"""
     me = game.current_turn
     op = 'black' if me == 'red' else 'red'
     return (prob is not None and prob >= DECIDED_PROB) or game.hp[me] - game.hp[op] >= DECIDED_LEAD
+
+
+def decided_for(prob, game, side):
+    """站在 side 一方：校准胜率很高，或领先超过一个将，算基本定局。"""
+    other = 'black' if side == 'red' else 'red'
+    return (prob is not None and prob >= DECIDED_PROB) or game.hp[side] - game.hp[other] >= DECIDED_LEAD
 
 
 def is_opening(game):
@@ -79,7 +99,7 @@ def is_opening(game):
 def opening_advice(red_prob, my_side=None, margin=OPENING_MARGIN):
     """按开局时红方（先手）的校准胜率给出抢红 / 加倍建议，返回几行文字。
     抢红 = 执红先走且倍率 ×2；加倍 = 倍率 ×2。胜率高于 50% 时期望收益为正，加倍就是把正的期望放大一倍，反之亦然。"""
-    lines = [f'开局评估：红方（先手）胜率约 {red_prob:.0%}']
+    lines = [f'开局评估：红方（先手）胜率约 {red_prob:.0%}（依据自对弈统计，待真人对局验证）']
     if red_prob >= 0.5 + margin:
         lines.append('抢红：建议抢（执红更有利）')
     elif red_prob <= 0.5 - margin:

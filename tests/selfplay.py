@@ -263,7 +263,7 @@ def vision_tests(check):
     check('兵/卒数量角标按空格数修正（3 → 5）', result.captured['red']['兵'] == 5 and result.notes)
     sync_tests(check, vision)
 
-    folder =os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sample_image')
+    folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sample_image')
     paths = sorted(glob.glob(os.path.join(folder, '*.png')))
     if not paths:
         print('  没有 sample_image/ 截图，跳过逐张识别')
@@ -275,6 +275,24 @@ def vision_tests(check):
         if result.problems:
             bad.append(f'{os.path.basename(path)}：{result.problems[0]}')
     check(f'{len(paths)} 张截图识别结果自洽' + ('' if not bad else '：' + bad[0]), not bad)
+
+    # 同步时找到棋盘后只截棋盘一带、按格子内容缓存识别结果：结果必须与整张截图、不用缓存时完全相同
+    from fanfanqi.sync import _watch_region
+
+    def summary(r):
+        return r.board, r.captured, r.players, r.turn, r.hp_bar, r.multiplier, r.problems
+
+    same = True
+    for path in paths[:6]:
+        rgb = vision.to_rgb(Image.open(path))
+        layout = vision.find_board(rgb)
+        vision._cell_cache.clear()
+        full = vision.recognize(rgb, layout=layout)
+        _, shifted, part = _watch_region(vision, rgb, layout)
+        vision._cell_cache.clear()
+        same = same and summary(vision.recognize(part, layout=shifted)) == summary(full) \
+            and summary(vision.recognize(rgb, layout=layout)) == summary(full)
+    check('只截棋盘一带、按格子缓存识别：结果与整张截图、不用缓存时相同', same)
 
 
 def sync_tests(check, vision):

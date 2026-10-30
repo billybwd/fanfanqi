@@ -131,7 +131,8 @@ class App:
         self.screen_multiplier = None  # 同步时最近一次识别到的画面倍率（认不出为 None）
         self.recorder = None           # 同步时的真人对局记录（records.py）
         self.record_queue = queue.Queue()  # 记录保存的状态提示
-        self.side_win = {}             # 各方最近一次搜索结果的校准胜率（见 calibration.py）
+        self.side_win = {}             # 双方最近一次搜索结果的校准胜率（见 calibration.py）
+        self.win_at = -1               # side_win 是在第几步（history 长度）的局面上算的
         self.opening_red = None        # 开局时红方（先手）的校准胜率，用于抢红 / 加倍建议
         self.sync_synced = False
         self.sync_queue = queue.Queue()
@@ -280,9 +281,11 @@ class App:
         result['calibrated'] = prob
         if prob is None:
             return
-        self.side_win[self.game.current_turn] = prob
-        if calibration.is_opening(self.game):
-            self.opening_red = prob if self.game.current_turn == 'red' else 1 - prob
+        me = self.game.current_turn
+        self.side_win = {me: prob, other_side(me): 1 - prob}
+        self.win_at = len(self.game.history)  # 这个胜率是在第几步的局面上算的（用来标“上一步的估计”）
+        if calibration.is_opening(self.game):  # 开局用单独拟合的开局模型
+            self.opening_red = calibration.opening_red_prob(result.get('info'), self.game, result.get('lam', 1.0))
 
     def on_setting_changed(self, _event=None):
         self.save_settings()
@@ -403,6 +406,9 @@ class App:
         self.hint_title_var = tk.StringVar()
         self.hint_text_var = tk.StringVar()
         self.hint_meta_var = tk.StringVar()
+        # 一直显示的我方胜率（对方回合也显示，见 win_text）
+        self.win_var = tk.StringVar()
+        wrapped(hint_box, textvariable=self.win_var, foreground='#1f5fa8').pack(anchor='w')
         wrapped(hint_box, textvariable=self.hint_title_var).pack(anchor='w')
         wrapped(hint_box, textvariable=self.hint_text_var, style='Hint.TLabel').pack(anchor='w', pady=4)
         wrapped(hint_box, textvariable=self.hint_meta_var, foreground='#666666').pack(anchor='w')
@@ -769,17 +775,21 @@ class App:
                 purpose = 'opening'  # 抢红前还认不出自己执哪方：单独评估开局，给抢红 / 加倍建议
             elif self.can_ponder():
                 purpose = 'ponder'
+            elif self.my_sides() and calibration.load():
+                purpose = 'evaluate'  # 对方回合也评估一次，好一直显示我方胜率
         if calibration.is_opening(g):
             self.opening_red = None  # 等这次的搜索结果
+        if len(g.history) < self.win_at:  # 悔棋 / 新对局：之前的胜率不再对应这局
+            self.side_win, self.win_at = {}, -1
         if purpose:
             token = self.ai_token
             model = self.model_var.get()
             budget_ms = {'move': self.ai_think_budget_ms(), 'hint': self.think_budget_ms(),
-                         'opening': self.think_budget_ms(),
+                         'opening': self.think_budget_ms(), 'evaluate': self.think_budget_ms(),
                          'ponder': max(1.0, float(self.config['ponder_time_sec'])) * 1000}[purpose]
             min_depth = self.hint_min_depth() if purpose == 'hint' else 0
             # 提前计算只为填充引擎的置换表，开局评估只要最终结果，都不显示中间结果
-            on_progress = None if purpose in ('ponder', 'opening') else \
+            on_progress = None if purpose in ('ponder', 'opening', 'evaluate') else \
                 (lambda h: self.ai_queue.put((token, 'hint_progress', h)))
             search = dict(self.config['search'])
             v16_params = self.config['v16']
@@ -797,7 +807,7 @@ class App:
                 threads = 4
             snapshot = g.clone()
             self.ai_busy = purpose == 'move'
-            self.pondering = purpose == 'ponder'
+            self.pondering = purpose in ('ponder', 'evaluate')
 
             def worker():
                 try:
@@ -839,8 +849,11 @@ class App:
                 elif purpose == 'opening':
                     self.record_win_prob(result)
                     self.update_hint_panel()
-                elif purpose == 'ponder':
-                    pass  # 结果留在引擎置换表里，界面上不用
+                elif purpose in ('ponder', 'evaluate'):
+                    # 对方回合的评估：只用来显示我方胜率（提前计算的结果同时留在引擎置换表里）
+                    self.pondering = False
+                    self.record_win_prob(result)
+                    self.update_hint_panel()
                 elif 'error' in result or not result.get('action'):
                     self.ai_busy = False
                     self.hint_meta_var.set(result.get('error', '电脑无棋可走'))
@@ -872,9 +885,40 @@ class App:
         mine = self.sync_side() if self.syncing else (self.player_side if self.is_vs() else None)
         return '\n'.join(calibration.opening_advice(self.opening_red, mine))
 
+    def my_sides(self):
+        """“我方”是哪一方（显示胜率用）：同步时是自己执的一方，人机对战是玩家，录入模式按提示方（两方都提示时两方都显示）。"""
+        if self.syncing:
+            mine = self.sync_side()
+            return (mine,) if mine else ()
+        if self.is_vs():
+            return (self.player_side,)
+        return HINT_SIDE_VALUES[_key_of(HINT_SIDE_LABELS, self.hint_side_var.get())]
+
+    def win_text(self):
+        """一直显示的我方胜率：对方回合用对方回合的评估换算；新一步还没算完时显示上一步的值并注明。"""
+        g = self.game
+        sides = [s for s in self.my_sides() if s in self.side_win]
+        if g.phase != 'playing' or not calibration.load():
+            return ''
+        if not sides:
+            return '我方胜率：计算中…' if self.my_sides() else ''
+        parts = []
+        for side in sides:
+            prob = self.side_win[side]
+            label = '我方' if len(self.my_sides()) == 1 else ''
+            text = f'{label}（{SIDE_NAMES[side]}）胜率约 {prob:.0%}' if label else f'{SIDE_NAMES[side]} {prob:.0%}'
+            if calibration.decided_for(prob, g, side):
+                text += '（基本定局）'
+            parts.append(text)
+        text = ' · '.join(parts) if len(parts) == 1 else '胜率约：' + ' · '.join(parts)
+        if self.win_at != len(g.history):
+            text += '（上一步的估计，正在更新）'
+        return text
+
     def update_hint_panel(self):
         g = self.game
         self.advice_var.set(self.opening_advice_text())
+        self.win_var.set(self.win_text())
         self.follow_btn.state(['disabled'])
         self.hint_title_var.set('')
         self.hint_meta_var.set('')
@@ -890,7 +934,10 @@ class App:
             self.hint_title_var.set(f'{side_name}行动')
             if self.pondering:
                 self.hint_text_var.set('对方思考中')
-                self.hint_meta_var.set('后台提前计算中，轮到你时提示更快更深')
+                self.hint_meta_var.set('后台评估局面中，结果用于上面的我方胜率'
+                                       + ('；同时提前计算，轮到你时提示更快更深' if self.can_ponder() else ''))
+            elif self.my_sides():
+                self.hint_text_var.set('对方思考中')
             else:
                 self.hint_text_var.set('（未开启该方提示）')
             return

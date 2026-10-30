@@ -341,6 +341,20 @@ def _key(rec):
             rec.turn, rec.turn_certain, rec.my_side, rec.game_over, bool(rec.problems), rec.multiplier)
 
 
+def _watch_region(vision, rgb, layout):
+    """找到棋盘后只截它周围一块（棋盘、两侧被吃子栏、头像和血量条、右上角倍率）：
+    返回 (屏幕坐标的截屏范围, 换算到这块图像里的网格, 这块图像)。"""
+    h, w = rgb.shape[:2]
+    left, top, right, bottom = vision.WATCH_REGION
+    x0, y0 = (max(0, int(v)) for v in layout.point(left, top))
+    x1, y1 = layout.point(right, bottom)
+    x1, y1 = min(w, int(x1) + 1), min(h, int(y1) + 1)
+    ox, oy = vision.screen_origin()
+    box = layout.box and (layout.box[0] - x0, layout.box[1] - y0, layout.box[2] - x0, layout.box[3] - y0)
+    shifted = vision.Layout(layout.x - x0, layout.y - y0, layout.cell, box=box)
+    return (ox + x0, oy + y0, ox + x1, oy + y1), shifted, rgb[y0:y1, x0:x1]
+
+
 class ScreenWatcher(threading.Thread):
     """后台截屏识别。post(kind, payload)：('rec', Recognition) 识别结果，('status', 文本) 状态。
 
@@ -376,27 +390,33 @@ class ScreenWatcher(threading.Thread):
     def run(self):
         from . import vision
         grab = self.grab or vision.grab_screen
+        # 装了 mss 时，找到棋盘后只截棋盘一带（快得多）；用自定义截屏函数（测试）或没有 mss 时每次截全屏
+        use_region = self.grab is None and vision.fast_grab_available()
+        region = None
         templates = self.templates or vision.default_templates()
         layout, last_sig, changed_at, recognized_at = None, None, 0.0, 0.0
         pending, dirty, dirty_since, poor = None, True, time.monotonic(), 0
         while not self._stop_event.is_set():
             started = time.monotonic()
             try:
-                rgb = vision.to_rgb(grab())
+                rgb = vision.to_rgb(grab(region) if region else grab())
             except Exception as exc:  # noqa: BLE001 — 截屏失败（锁屏等）时稍后重试
                 self.post('status', f'截屏失败：{exc}')
                 self._stop_event.wait(1.0)
                 continue
             if layout is None:
+                region = None
                 layout = vision.find_board(rgb, templates)
                 if layout is None:
                     self.post('status', '屏幕上没有找到棋盘（游戏窗口需要可见，不能被遮挡或最小化）')
                     self._stop_event.wait(1.0)
                     continue
+                if use_region:
+                    region, layout, rgb = _watch_region(vision, rgb, layout)
                 last_sig, pending = None, None
             sig = _signature(rgb, layout)
             if sig is None:
-                layout = None
+                layout = region = None
                 continue
             if last_sig is None or sig.shape != last_sig.shape or float(np.abs(sig - last_sig).mean()) > 1.0:
                 changed_at = started
@@ -417,7 +437,7 @@ class ScreenWatcher(threading.Thread):
                 if not rec.game_over and rec.quality < vision.GOOD_QUALITY:
                     poor += 1
                     if poor >= 2:  # 连续两次对不上：棋盘移动了或被遮挡，重新找
-                        layout, poor = None, 0
+                        layout, region, poor = None, None, 0
                         self.post('status', '棋盘位置变化，重新定位…')
                     continue
                 poor = 0

@@ -140,7 +140,25 @@ def cmd_fit(args):
         sel = [y for p, y in zip(cal_open, red_wins) if lo <= p < hi]
         if sel:
             print(f'  校准红方胜率 {lo:.0%}~{min(hi, 1):.0%}：{len(sel)} 局，实际红方胜率 {sum(sel) / len(sel):.1%}')
+    # 开局单独一个模型：开局时引擎评估的区分力很弱（交叉验证见下），主要是先手的平均胜率，再按评估略作调整
+    import numpy as np
+    xo = np.array([[1.0, features(it['score'], it['multiplier'], 0, 28)[1]] for it in openings])
+    yo = np.array(red_wins)
+    order = list(range(len(openings)))
+    random.Random(0).shuffle(order)
+    folds = [order[k::5] for k in range(5)]
+    base_ll, model_ll = [], []
+    for fold in folds:
+        test = set(fold)
+        train_idx = [i for i in order if i not in test]
+        p0 = yo[train_idx].mean()
+        base_ll.append(log_loss([p0] * len(fold), yo[fold]))
+        wo = fit_logistic(xo[train_idx], yo[train_idx])
+        model_ll.append(log_loss(list(1 / (1 + np.exp(-xo[fold] @ wo))), yo[fold]))
+    wo = fit_logistic(xo, yo)
+    print(f'开局 5 折交叉验证对数损失：只用先手平均胜率 {sum(base_ll) / 5:.4f}，加上引擎开局评估 {sum(model_ll) / 5:.4f}')
     model.update({
+        'opening_weights': [float(v) for v in wo],
         'source': os.path.basename(args.data), 'positions': len(items),
         'red_first_win_rate': round(base, 4), 'red_first_win_rate_se': round(se, 4),
     })
