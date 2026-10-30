@@ -14,8 +14,10 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from . import calibration
 from .advisor import AI_MODELS, compute_hint, describe_last_action, pos_text
 from .config import load_config, save_config
+from .records import GameRecorder
 from .game import (
     COLS, COMBO_THRESHOLD, DEFAULT_LONG_CHASE_LIMIT, DEFAULT_NO_CAPTURE_LIMIT,
     INITIAL_HP, PIECE_CONFIG, PIECE_NAMES, ROWS, SIDE_NAMES, Game, other_side,
@@ -127,6 +129,10 @@ class App:
         self.sync_watcher = None
         self.board_sync = None
         self.screen_multiplier = None  # 同步时最近一次识别到的画面倍率（认不出为 None）
+        self.recorder = None           # 同步时的真人对局记录（records.py）
+        self.record_queue = queue.Queue()  # 记录保存的状态提示
+        self.side_win = {}             # 各方最近一次搜索结果的校准胜率（见 calibration.py）
+        self.opening_red = None        # 开局时红方（先手）的校准胜率，用于抢红 / 加倍建议
         self.sync_synced = False
         self.sync_queue = queue.Queue()
 
@@ -256,9 +262,27 @@ class App:
         return game.get_multiplier()['multiplier'], '基础'
 
     def winning_now(self, game):
-        """倍率达到「求胜倍率」：提示和电脑走子都只求胜。"""
+        """倍率达到「求胜倍率」且轮到走的一方没有落后：提示和电脑走子都只求胜。
+        落后时仍按原目标（λ = 1）走：它会设法缩小倍率、少输，比只追求翻盘的那一点胜率更划算。
+        是否落后看这一方上一次搜索的校准胜率（< 50%），还没有时看血量是否落后。"""
         threshold = self.win_now_multiplier()
-        return threshold > 0 and self.current_multiplier(game)[0] >= threshold
+        if threshold <= 0 or self.current_multiplier(game)[0] < threshold:
+            return False
+        me = game.current_turn
+        prob = self.side_win.get(me)
+        if prob is not None:
+            return prob >= 0.5
+        return game.hp[me] >= game.hp[other_side(me)]
+
+    def record_win_prob(self, result):
+        """记下搜索结果的校准胜率（站在当前轮到走的一方）；开局时同时记作红方胜率，给抢红 / 加倍建议用。"""
+        prob = calibration.win_prob(result.get('info'), self.game, result.get('lam', 1.0))
+        result['calibrated'] = prob
+        if prob is None:
+            return
+        self.side_win[self.game.current_turn] = prob
+        if calibration.is_opening(self.game):
+            self.opening_red = prob if self.game.current_turn == 'red' else 1 - prob
 
     def on_setting_changed(self, _event=None):
         self.save_settings()
@@ -382,6 +406,9 @@ class App:
         wrapped(hint_box, textvariable=self.hint_title_var).pack(anchor='w')
         wrapped(hint_box, textvariable=self.hint_text_var, style='Hint.TLabel').pack(anchor='w', pady=4)
         wrapped(hint_box, textvariable=self.hint_meta_var, foreground='#666666').pack(anchor='w')
+        # 开局（还没走第一步）时的抢红 / 加倍建议，其余时候为空
+        self.advice_var = tk.StringVar()
+        wrapped(hint_box, textvariable=self.advice_var, foreground='#b05000').pack(anchor='w')
         hb = ttk.Frame(hint_box)
         hb.pack(anchor='w', pady=(4, 0))
         self.follow_btn = ttk.Button(hb, text='按提示走', width=8, command=self.follow_hint)
@@ -705,9 +732,10 @@ class App:
         factor = self.board_sync.room_factor if self.syncing and self.board_sync else None
         if factor and factor > 1:  # 画面倍率还乘了抢红/加倍的系数（对走法没有影响）
             text = f"{factor * m['multiplier']} = 系数 {factor} × " + text.split(' = ', 1)[1]
-        if self.winning_now(g):
-            value, source = self.current_multiplier(g)
-            text += f'\n{source}倍率 {value} 已达求胜倍率 {self.win_now_multiplier()}：只求胜'
+        value, source = self.current_multiplier(g)
+        if self.win_now_multiplier() > 0 and value >= self.win_now_multiplier():
+            text += f'\n{source}倍率 {value} 已达求胜倍率 {self.win_now_multiplier()}：' + \
+                ('只求胜' if self.winning_now(g) else '但轮到的一方落后，仍按原目标设法少输')
         self.mult_var.set(text)
         # 每段达到 3 次的连击都累计；当前连击段达到 3 次后实时计入。
         counted = [f"{'红' if s == 'red' else '黑'}方 {m['combo_points'][s]} 分"
@@ -737,23 +765,31 @@ class App:
                 purpose = 'move'
             elif g.current_turn in self.hint_sides():
                 purpose = 'hint'
+            elif calibration.is_opening(g) and calibration.load():
+                purpose = 'opening'  # 抢红前还认不出自己执哪方：单独评估开局，给抢红 / 加倍建议
             elif self.can_ponder():
                 purpose = 'ponder'
+        if calibration.is_opening(g):
+            self.opening_red = None  # 等这次的搜索结果
         if purpose:
             token = self.ai_token
             model = self.model_var.get()
             budget_ms = {'move': self.ai_think_budget_ms(), 'hint': self.think_budget_ms(),
+                         'opening': self.think_budget_ms(),
                          'ponder': max(1.0, float(self.config['ponder_time_sec'])) * 1000}[purpose]
             min_depth = self.hint_min_depth() if purpose == 'hint' else 0
-            # 提前计算只为填充引擎的置换表，不显示中间结果
-            on_progress = None if purpose == 'ponder' else (lambda h: self.ai_queue.put((token, 'hint_progress', h)))
+            # 提前计算只为填充引擎的置换表，开局评估只要最终结果，都不显示中间结果
+            on_progress = None if purpose in ('ponder', 'opening') else \
+                (lambda h: self.ai_queue.put((token, 'hint_progress', h)))
             search = dict(self.config['search'])
             v16_params = self.config['v16']
             v17_params = self.config['v17']
+            lam = float(v17_params.get('multiplier_exponent', 1.0))
             if self.winning_now(g):
                 # 倍率已够大：只看胜率（λ = 0），先把这局赢下来（提示和人机对战的电脑都按此走）
                 v16_params = {**v16_params, 'multiplier_exponent': 0.0}
                 v17_params = {**v17_params, 'multiplier_exponent': 0.0}
+                lam = 0.0
             engine = 'go' if self.engine_var.get() == 'Go' else 'python'
             try:
                 threads = min(64, max(1, int(self.threads_var.get())))
@@ -771,6 +807,7 @@ class App:
                                           should_stop=lambda: token != self.ai_token)
                 except Exception as exc:  # noqa: BLE001 — AI 出错不应影响对局
                     result = {'error': f'{type(exc).__name__}: {exc}'}
+                result['lam'] = lam  # 校准胜率要知道搜索值里倍率的次数
                 self.ai_queue.put((token, purpose, result))
 
             threading.Thread(target=worker, daemon=True).start()
@@ -779,6 +816,8 @@ class App:
 
     def _poll_ai_queue(self):
         self._poll_sync_queue()
+        while not self.record_queue.empty():
+            self.sync_status_var.set(self.record_queue.get_nowait())
         try:
             while True:
                 token, purpose, result = self.ai_queue.get_nowait()
@@ -792,14 +831,21 @@ class App:
                         self.draw_board()
                 elif purpose == 'hint':
                     self.hint = result
+                    self.record_win_prob(result)
+                    if self.syncing and self.recorder:  # 记下给自己的建议，之后可统计“是否按建议走、走了结果如何”
+                        self.recorder.note_hint(self.game, result.get('action'), result.get('calibrated'))
                     self.update_hint_panel()
                     self.draw_board()
+                elif purpose == 'opening':
+                    self.record_win_prob(result)
+                    self.update_hint_panel()
                 elif purpose == 'ponder':
                     pass  # 结果留在引擎置换表里，界面上不用
                 elif 'error' in result or not result.get('action'):
                     self.ai_busy = False
                     self.hint_meta_var.set(result.get('error', '电脑无棋可走'))
                 else:
+                    self.record_win_prob(result)
                     delay = max(0, int(self.config['ai_move_delay_ms']))
                     self.root.after(delay, lambda t=token, a=result['action']: self.apply_ai_move(t, a))
         except queue.Empty:
@@ -816,8 +862,19 @@ class App:
         else:
             self.do_move(action['from_row'], action['from_col'], action['to_row'], action['to_col'])
 
+    def opening_advice_text(self):
+        """开局（还没走第一步）时的抢红 / 加倍建议；知道自己执哪方时只给这一方的加倍建议。"""
+        g = self.game
+        if not calibration.is_opening(g) or not calibration.load():
+            return ''
+        if self.opening_red is None:
+            return '开局评估计算中…（抢红 / 加倍建议）'
+        mine = self.sync_side() if self.syncing else (self.player_side if self.is_vs() else None)
+        return '\n'.join(calibration.opening_advice(self.opening_red, mine))
+
     def update_hint_panel(self):
         g = self.game
+        self.advice_var.set(self.opening_advice_text())
         self.follow_btn.state(['disabled'])
         self.hint_title_var.set('')
         self.hint_meta_var.set('')
@@ -857,7 +914,10 @@ class App:
                 meta.append('依据：紧急战术（护将 / 防兵杀 / 强制吃子）')
             elif info.get('source') == 'search':
                 meta.append(f"依据：Alpha-Beta 搜索 {info.get('depth')} 层")
-                if info.get('win_prob') is not None:
+                prob = self.hint.get('calibrated')
+                if prob is not None:  # 按自对弈实际胜负校准过的胜率（calibration.py）
+                    meta.append(f'胜率约 {prob:.0%}' + ('（基本定局）' if calibration.decided(prob, g) else ''))
+                elif info.get('win_prob') is not None:
                     meta.append(f"预估胜率 {info['win_prob']:.0%}")
                 elif info.get('score') is not None:
                     meta.append(f"评估 {info['score']:+.0f}")
@@ -1086,6 +1146,7 @@ class App:
             messagebox.showerror('画面同步', str(exc))
             return
         self.board_sync = BoardSync(self.config.get('rules'))
+        self.recorder = GameRecorder(on_status=self.record_queue.put)
         self.sync_synced = False  # 第一次识别结果出来前，界面上的对局与画面无关
         self.sync_watcher = ScreenWatcher(lambda kind, payload: self.sync_queue.put((kind, payload)),
                                           save_failed=self.config.get('save_failed_frames', True))
@@ -1105,6 +1166,7 @@ class App:
             self.sync_queue.get_nowait()
         self.sync_btn.configure(text='开始同步')
         self.sync_status_var.set('已停止同步；可以继续手动录入')
+        self.finish_record('停止同步')
         self.screen_multiplier = None
         self.request_ai()
         self.refresh()
@@ -1120,7 +1182,38 @@ class App:
             else:
                 self.apply_sync(payload)
 
+    def finish_record(self, reason):
+        """结束并保存当前这局的真人对局记录（records.py）。"""
+        if self.recorder and self.recorder.active:
+            self.recorder.finish(self.game if self.sync_synced else None, reason, self.board_sync.my_side,
+                                 self.board_sync.room_factor, self.screen_multiplier)
+
+    def sync_record(self, update, rec, old_len):
+        """把同步结果记进真人对局记录：新对局开始新记录，按动作推进记每一步，结束时保存。"""
+        if not self.recorder:
+            return
+        if update.kind == 'skip':
+            if rec.game_over and self.recorder.active:  # 结算画面：最后一步可能没看到，按当前局面保存
+                self.finish_record('出现结算画面')
+            return
+        game = self.game
+        if update.kind == 'new':
+            self.finish_record('新对局开始（上一局没看到结束）')
+            self.recorder.start(game, 'new')
+        elif update.kind == 'import':
+            if self.recorder.active:
+                self.recorder.event('import', game)  # 漏看了几步，整体导入
+            else:
+                self.recorder.start(game, 'import')
+        elif update.kind == 'step':
+            self.recorder.step(game, old_len, self.screen_multiplier)
+        elif update.kind == 'turn':
+            self.recorder.event('turn', game, side=game.current_turn)
+        if game.phase == 'over' and self.recorder.active:
+            self.finish_record('对局结束')
+
     def apply_sync(self, rec):
+        old_len = len(self.game.history) if self.sync_synced else 0
         update = self.board_sync.update(rec, self.game if self.sync_synced else None)
         was_winning = self.winning_now(self.game)
         if update.kind != 'skip':  # 与同步到的局面同一帧的画面倍率
@@ -1143,6 +1236,7 @@ class App:
             self.clear_selection()
             self.request_ai()
             self.refresh()
+        self.sync_record(update, rec, old_len)
         mine = self.sync_side()
         parts = ['同步中', f'我执{SIDE_NAMES[mine]}' if mine else '还认不出我执哪一方（翻出第一个子后确定）']
         if self.sync_synced and self.game.phase == 'playing' and mine:

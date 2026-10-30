@@ -190,6 +190,7 @@ def run_tests():
         check(f'{name}：{len(positions)} 个局面最大误差 {worst:.1e}', worst < 1e-9)
 
     go_parity_tests(check)
+    calibration_tests(check)
     vision_tests(check)
     print(f'\n{"全部通过" if failures == 0 else f"{failures} 项失败"}')
     return failures
@@ -222,6 +223,27 @@ def go_parity_tests(check):
         total += 1
         same += go.get_move(g.clone()) == py.get_move(g.clone())
     check(f'{same}/{total} 个局面着法相同', same == total)
+
+
+def calibration_tests(check):
+    """校准胜率与抢红 / 加倍建议（用一组手写系数，不依赖 calibration.json）。"""
+    from fanfanqi import calibration
+
+    print('\n胜率校准与开局建议')
+    model = {'weights': [0.0, 1.0, 2.0, 0.0]}
+    game = Game()
+    random_setup(game)
+    even = calibration.win_prob({'score': 0.0, 'multiplier': 20}, game, model=model)
+    ahead = calibration.win_prob({'score': 10.0, 'multiplier': 20}, game, model=model)
+    halved = calibration.win_prob({'score': 0.5, 'multiplier': 20}, game, lam=0.0, model=model)
+    check('搜索值为 0、血量相同时校准胜率 50%；搜索值越高越大；λ = 0 时搜索值不再除以倍率',
+          abs(even - 0.5) < 1e-9 and ahead > even and abs(halved - ahead) < 1e-9)
+    check('开局识别：放好 4 个明子、还没走第一步', calibration.is_opening(game))
+    grab = calibration.opening_advice(0.56)
+    keep = calibration.opening_advice(0.45, 'black')
+    check('抢红 / 加倍建议：红方 56% 建议抢、执红建议加倍；红方 45% 不抢、执黑（55%）建议加倍',
+          '建议抢' in grab[1] and '建议加倍' in grab[2] and '不抢' in keep[1]
+          and len(keep) == 3 and '建议加倍' in keep[2])
 
 
 def vision_tests(check):
@@ -349,6 +371,46 @@ def sync_tests(check, vision):
             ok_now = mine.get_multiplier()['multiplier'] * factor == shown or real.phase != 'playing'
             solved += mine.flip_score == real.flip_score and ok_now
     check(f'画面倍率：中途导入后跨帧反推，{solved}/{total} 局完全还原 F 和翻棋分，没有解错', wrong == 0)
+
+    # 真人对局记录：逐步同步一局，记录的步数、建议、结果与真实对局一致
+    import json as _json
+    import tempfile
+    from fanfanqi.records import GameRecorder
+    with tempfile.TemporaryDirectory() as repo:
+        recorder = GameRecorder(directory=repo)
+        real = Game()
+        random_setup(real)
+        sync, mine, plies = BoardSync(), None, 0
+        for step in range(300):
+            if real.phase != 'playing':
+                break
+            old_len = len(mine.history) if mine else 0
+            update = sync.update(rec_of(real), mine, now=2.0 * step)
+            mine = update.game or mine
+            if update.kind == 'new':
+                recorder.start(mine, 'new')
+            elif update.kind == 'step':
+                recorder.step(mine, old_len)
+            if mine.current_turn == 'red':
+                recorder.note_hint(mine, {'type': 'hint-marker'}, 0.5)
+            apply_real(real, rng.choice(real.get_all_actions()))
+            plies += 1
+        update = sync.update(rec_of(real), mine, now=999.0)
+        recorder.step(update.game or mine, len(mine.history))
+        path = recorder.finish(update.game or mine, '对局结束', my_side='red')
+        recorder.start(mine, 'new')  # 同一小时再存一局：追加到同一个文件
+        recorder.step(update.game or mine, 1)
+        second = recorder.finish(update.game or mine, '停止同步', my_side='red')
+        with open(path, encoding='utf-8') as f:
+            lines = [_json.loads(line) for line in f]
+        saved = lines[0]
+        hinted = all(('hint' in m) == (m['side'] == 'red') for m in saved['moves'])
+        expected = 'draw' if real.winner == 'draw' else ('win' if real.winner == 'red' else 'loss')
+        check(f'对局记录：{len(saved["moves"])} 步与真实对局 {plies} 步一致、红方每步带建议、结果 {saved["result"]}',
+              len(saved['moves']) == plies and hinted and saved['result'] == expected)
+        check('对局记录按小时分文件：同一小时的两局追加在同一个 .jsonl 里，一行一局',
+              second == path and path.endswith('.jsonl') and len(lines) == 2)
+
 
 
 if __name__ == '__main__':
