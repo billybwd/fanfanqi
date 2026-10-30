@@ -61,6 +61,13 @@ DEFAULT_PARAMS.update({
 # -8 Elo over 300 games at 1 s/move (95% interval -45 ~ +28), i.e. no measurable loss; kept because it is
 # closer to human judgement. Previous values: params/v17-before-spsa-20261030.json.
 DEFAULT_PARAMS['weights'].update({'hanging': 0.62, 'pool': 0.28, 'king_cannon': 5.79})
+# Fitted on self-play quiet positions (2026-10-30): evaluation 12 HP was converted to win probabilities far too
+# confidently (positions it called ~1% were won 18.5% of the time, so badly losing lines were given up early,
+# e.g. by walking the king into capture); the best fit is about 20. The side to move also loses noticeably more
+# often than its evaluation says (fitted offset about -10 HP); half of that is applied to tempo. Both are set
+# directly and still to be confirmed with tools/tune.py sprt.
+DEFAULT_PARAMS['win_temperature'] = 20.0
+DEFAULT_PARAMS['weights']['tempo'] = -5.0
 DEFAULT_PARAMS['weights']['piece_value'] = {
     '将': 10.56, '仕': 6.05, '象': 2.94, '车': 2.09, '马': 1.55, '炮': 3.23, '兵': 1.57,
 }

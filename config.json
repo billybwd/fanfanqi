@@ -62,7 +62,7 @@
   "v17": {
     "multiplier_exponent": 1.0,
     "loss_aversion": 1.0,
-    "win_temperature": 12.0,
+    "win_temperature": 20.0,
     "max_depth": 20,
     "root_flips": 8,
     "node_flips": 3,
@@ -88,7 +88,7 @@
       "king_soldier_near": 3,
       "king_cannon": 5.79,
       "king_trapped": 2,
-      "tempo": 0.5
+      "tempo": -5.0
     },
     "q_hidden_caps": 1,
     "q_hidden_depth": 0,
