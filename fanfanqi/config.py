@@ -45,6 +45,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'ponder_time_sec': 30,
     # 画面同步时，画面静止却识别出问题的帧存到 sample_image/failed（只截棋盘一带），用来补识别模板
     'save_failed_frames': True,
+    # 最多保留多少张（满了删最旧的）；每张约 0.9MB
+    'failed_frames_limit': 1000,
     # 人机对战中电脑算完后再停顿多久落子（毫秒），便于看清
     'ai_move_delay_ms': 400,
     # StrategicV15AI 搜索参数（高级）。数值越大越强也越慢；含义见 README

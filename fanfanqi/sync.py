@@ -360,15 +360,18 @@ class ScreenWatcher(threading.Thread):
 
     interval  截屏间隔（秒）；settle 画面连续不变多久才识别；refresh 画面不变时多久复查一次（轮次、倒计时框）。
     画面一直在变（特效动画）超过 3 秒时也照常识别，连续两次一致才交出。
-    save_failed  画面静止却识别出问题时，把棋盘一带存到 sample_image/failed（同一画面只存一次，最多每 5 秒一张）。"""
+    save_failed  画面静止却识别出问题时，把棋盘一带存到 sample_image/failed（同一画面只存一次，最多每 5 秒一张），
+                 最多保留 failed_limit 张（满了删最旧的）。"""
 
-    def __init__(self, post, interval=0.15, settle=0.3, refresh=0.5, grab=None, templates=None, save_failed=False):
+    def __init__(self, post, interval=0.15, settle=0.3, refresh=0.5, grab=None, templates=None, save_failed=False,
+                 failed_limit=1000):
         super().__init__(daemon=True)
         self.post = post
         self.interval, self.settle, self.refresh = interval, settle, refresh
         self.grab = grab
         self.templates = templates
         self.save_failed = save_failed
+        self.failed_limit = failed_limit
         self._saved = (None, 0.0)
         self._stop_event = threading.Event()
 
@@ -381,7 +384,7 @@ class ScreenWatcher(threading.Thread):
             return
         self._saved = (_key(rec), now)
         try:
-            path = vision.save_frame(rgb, layout, rec.problems)
+            path = vision.save_frame(rgb, layout, rec.problems, limit=self.failed_limit)
         except OSError:
             return
         if path:

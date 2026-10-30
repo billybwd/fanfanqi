@@ -871,7 +871,7 @@ def grab_screen(bbox=None):
 FAILED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sample_image', 'failed')
 
 
-def save_frame(rgb, layout, problems, directory=FAILED_DIR, limit=300):
+def save_frame(rgb, layout, problems, directory=FAILED_DIR, limit=1000):
     """把识别没把握的画面存下来（只截棋盘、被吃子栏和头像一带，不存整个屏幕），附上问题说明，
     之后可以用 tools/vision_templates.py 补模板。最多保留 limit 张：满了就删掉最旧的（连同说明），
     始终保留最近的画面。返回文件路径。"""
